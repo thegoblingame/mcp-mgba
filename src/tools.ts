@@ -281,6 +281,182 @@ const TOOLS: Tool[] = [
     },
   },
 
+  // ── Memory search & diff ────────────────────────────────────────────────
+
+  {
+    name: "mgba_search_memory",
+    description:
+      "PURPOSE: Scan a memory region inside the emulator for a value, raw byte pattern, or ASCII string, and return the matching addresses. " +
+      "USAGE: This is the tool for LOCATING an unknown address — reach for it instead of looping mgba_read_range and eyeballing hex (a full EWRAM sweep is 64 round-trips that way, and 1 this way; the scan itself runs in Lua inside mGBA). Supply EXACTLY ONE of `value` (with `width`), `bytes`, or `text`. " +
+      "For the classic narrowing workflow, pass `store_as` to keep the full result set inside the emulator, then call again with `candidates` naming that set to re-test only those addresses after the value changes on screen — repeat until the count is small enough to read: " +
+      "search(value=200, region='EWRAM', width=2, store_as='gold') → 4213 hits; <spend gold in game>; search(value=150, candidates='gold', store_as='gold') → 3 hits. " +
+      "When you don't know the value at all and only know that SOMETHING changed, use mgba_snapshot_memory + mgba_diff_memory instead. " +
+      "BEHAVIOR: No side effects on game state — pure read (it does store a named candidate set inside the bridge when `store_as` is given, overwriting any set of the same name). The scan runs synchronously inside one mGBA frame callback, so a full 256 KiB EWRAM sweep briefly stalls emulation for roughly one frame. Chunked reads are concatenated before searching, so patterns spanning chunk boundaries are still found, and overlapping matches are reported. At most 100000 hits are retained per set (`collect_capped` flags this). Returns an error if no search term is given, more than one region form is invalid, `candidates` names an unknown set, or the region is unmapped. " +
+      `RETURNS: A count, the region searched, and up to \`max_results\` matching addresses in hex; notes when the list was truncated or the retained set was capped.\n\n${GBA_REGIONS}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        value: {
+          type: "integer",
+          description:
+            "Numeric value to find, encoded little-endian at `width` bytes (matching GBA/GB native endianness). Mutually exclusive with `bytes` and `text`. Pair with `width` — searching an 8-bit stat as the default 4-byte width will find nothing.",
+        },
+        width: {
+          type: "integer",
+          enum: [1, 2, 4],
+          default: 4,
+          description:
+            "Byte width for `value` (1, 2, or 4; default 4). Also sets the default `align`. Use 1 for stats/counters/flags, 2 for most 16-bit game-state fields, 4 for pointers and large counters. Ignored for `bytes`/`text` searches.",
+        },
+        bytes: {
+          type: "array",
+          items: { type: "integer", minimum: 0, maximum: 255 },
+          minItems: 1,
+          description:
+            "Raw byte sequence to find, each element 0-255, matched literally in order. Mutually exclusive with `value` and `text`. Use for struct signatures and multi-field patterns (e.g. a known pair of ROM pointers).",
+        },
+        text: {
+          type: "string",
+          description:
+            "ASCII string to find, matched literally. Mutually exclusive with `value` and `bytes`. Useful for player/character names and other in-RAM text, which often sit at a fixed offset inside a larger struct you're trying to locate.",
+        },
+        region: {
+          type: "string",
+          enum: ["EWRAM", "IWRAM", "PALETTE", "VRAM", "OAM", "WRAM", "SRAM", "HRAM"],
+          description:
+            "Named region to search, as a shorthand for address+length. GBA: EWRAM (0x02000000, 256 KiB — where most game state lives), IWRAM (0x03000000, 32 KiB), PALETTE, VRAM, OAM. GB/GBC: WRAM (0xC000), SRAM (0xA000), HRAM (0xFF80). Mutually exclusive with address+length; ignored when `candidates` is given, since a stored set carries its own region.",
+        },
+        address: {
+          type: "integer",
+          description:
+            "Start address, when searching a custom span rather than a named `region`. Must be paired with `length`. Same address conventions as the read tools.",
+        },
+        length: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Number of bytes to search from `address` (max 16777216). Unlike mgba_read_range there is no 4096 cap here — the scan happens inside the emulator, so only the matching addresses cross the wire.",
+        },
+        align: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Only report matches whose ABSOLUTE address is a multiple of this. Defaults to `width` for value searches (game structs are aligned, so this typically removes ~75% of false positives on a 4-byte search) and 1 for bytes/text. Set to 1 to find unaligned matches.",
+        },
+        candidates: {
+          type: "string",
+          description:
+            "Name of a previously stored candidate set to narrow instead of scanning fresh. Only the addresses in that set are re-tested against the new search term, and the set's own region is reused. This is the iterative-narrowing step — the fast way to pin down a value you can watch change on screen.",
+        },
+        store_as: {
+          type: "string",
+          description:
+            "Store the FULL result set inside the bridge under this name (overwriting any existing set with the same name) so it can be narrowed later via `candidates`. The stored set is not size-limited by `max_results` — that only caps what is returned to you. Sets live until overwritten or until bridge.lua is reloaded.",
+        },
+        max_results: {
+          type: "integer",
+          minimum: 1,
+          default: 64,
+          description:
+            "How many matching addresses to return inline (default 64). The total match count is always reported, and `store_as` retains everything — this only bounds the response size.",
+        },
+      },
+    },
+  },
+  {
+    name: "mgba_snapshot_memory",
+    description:
+      "PURPOSE: Capture a region of emulated memory into a named buffer held inside the bridge, for later comparison with mgba_diff_memory. " +
+      "USAGE: Step one of the 'I don't know the value, I only know something changed' workflow — snapshot, perform the in-game action (end a turn, take damage, spend money), then mgba_diff_memory to see exactly which addresses moved. This is how you find a counter whose encoding you can't guess. Prefer this over pulling two mgba_read_range dumps and comparing them yourself: the comparison happens in-emulator, so only the changed addresses cross the wire. When you DO know the value to look for, use mgba_search_memory instead. " +
+      "BEHAVIOR: No side effects on game state — pure read, plus it stores the captured bytes inside the bridge under `name` (overwriting any snapshot of the same name). Memory is held until overwritten or bridge.lua is reloaded; a full EWRAM snapshot costs 256 KiB inside mGBA. Since this build may lack pause, the capture is taken from a running emulator across several chunked reads — fine for turn-based or paused-on-a-menu states, less so mid-animation. Returns an error if the region is unmapped or exceeds 16 MiB. " +
+      "RETURNS: Single line confirming the snapshot name, address and byte count.",
+    inputSchema: {
+      type: "object",
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "Identifier for this snapshot, referenced later by mgba_diff_memory (e.g. 'playstate', 'ewram'). Re-using a name overwrites the previous capture.",
+        },
+        region: {
+          type: "string",
+          enum: ["EWRAM", "IWRAM", "PALETTE", "VRAM", "OAM", "WRAM", "SRAM", "HRAM"],
+          description:
+            "Named region to capture, as a shorthand for address+length. EWRAM is the usual choice for a broad hunt; a narrow address+length is better when you already know the struct and want a fast, low-noise diff.",
+        },
+        address: {
+          type: "integer",
+          description: "Start address, when capturing a custom span rather than a named `region`. Must be paired with `length`.",
+        },
+        length: {
+          type: "integer",
+          minimum: 1,
+          description: "Number of bytes to capture from `address` (max 16777216).",
+        },
+      },
+    },
+  },
+  {
+    name: "mgba_diff_memory",
+    description:
+      "PURPOSE: Compare a named snapshot against the current contents of the same region and report which addresses changed, with their before and after values. " +
+      "USAGE: Step two of the snapshot/act/diff workflow — the fastest way to locate a value you can trigger but can't guess (turn counters, gold, HP, chapter ID, RNG state). Use `predicate` to express what you know: 'changed' when you only know it moved, 'increased'/'decreased' when you know the direction, 'equals' when you now know the exact value, 'unchanged' to narrow by exclusion. Set `width` to the field size you expect (1 for most stats and counters, 2 for gold/experience-scale values, 4 for pointers). " +
+      "Pass `store_as` to save the matching addresses as a candidate set that mgba_search_memory can narrow further, and `refresh` to re-baseline the snapshot so you can immediately act again and diff again — that loop is how a broad first pass collapses to a handful of addresses. " +
+      "BEHAVIOR: No side effects on game state — pure read (it does re-read the region, and optionally re-baseline the snapshot when `refresh` is set, and store a candidate set when `store_as` is set). Comparison runs in-emulator: whole 4 KiB blocks are compared first and only differing blocks are walked byte-by-byte, so a narrow diff over a large region stays cheap. At most 100000 matches are retained (`collect_capped` flags this). Returns an error if `name` is an unknown snapshot, `predicate` is unrecognised, `width` isn't 1/2/4, or 'equals' is used without `value`. " +
+      "RETURNS: The region and predicate used, the total match count, and up to `max_results` entries as 'ADDR: BEFORE → AFTER' in decimal and hex.",
+    inputSchema: {
+      type: "object",
+      required: ["name"],
+      properties: {
+        name: {
+          type: "string",
+          description: "Name of the snapshot to compare against, as passed to mgba_snapshot_memory. Unknown names return an error rather than silently comparing nothing.",
+        },
+        predicate: {
+          type: "string",
+          enum: ["changed", "unchanged", "increased", "decreased", "equals"],
+          default: "changed",
+          description:
+            "Which addresses to report. 'changed' (default) for any difference; 'increased'/'decreased' when you know which way the on-screen value moved — far more selective than 'changed' and usually the right first filter; 'equals' to keep only addresses now holding `value`; 'unchanged' to narrow by exclusion when the value should have stayed put.",
+        },
+        value: {
+          type: "integer",
+          description: "Target value for predicate 'equals', interpreted little-endian at `width` bytes. Required for that predicate, ignored otherwise.",
+        },
+        width: {
+          type: "integer",
+          enum: [1, 2, 4],
+          default: 1,
+          description:
+            "Byte width used to interpret both snapshots (1, 2, or 4; default 1). Also sets the default `align`. A counter stored as u8 will still be found with width 1 even if the surrounding field is wider, so start at 1 for an unknown field and widen if the deltas look like noise.",
+        },
+        align: {
+          type: "integer",
+          minimum: 1,
+          description: "Only test addresses that are a multiple of this (defaults to `width`). Set to 1 to catch unaligned fields at the cost of more false positives.",
+        },
+        store_as: {
+          type: "string",
+          description:
+            "Store the matching addresses inside the bridge under this name, so mgba_search_memory can narrow them later with `candidates`. Retains all matches, not just the returned ones.",
+        },
+        refresh: {
+          type: "boolean",
+          default: false,
+          description:
+            "Re-baseline the snapshot to the current contents after diffing, so the next diff measures from now. Set this when running the act/diff/act/diff narrowing loop; leave false to keep comparing against the original capture.",
+        },
+        max_results: {
+          type: "integer",
+          minimum: 1,
+          default: 64,
+          description: "How many changed addresses to return inline (default 64). The total count is always reported and `store_as` retains everything.",
+        },
+      },
+    },
+  },
+
   // ── Input ───────────────────────────────────────────────────────────────
 
   {
@@ -313,6 +489,83 @@ const TOOLS: Tool[] = [
           default: 1,
           description:
             "Number of frames to release ALL keys after the hold, before the next queued press fires (default 1). Increase to 2-4 if a ROM debounces input and misses back-to-back presses; this gap is what lets the ROM see two distinct edge events instead of one long hold.",
+        },
+      },
+    },
+  },
+
+  {
+    name: "mgba_press_sequence",
+    description:
+      "PURPOSE: Queue an entire ordered sequence of button presses in a single call, and by default wait until the whole sequence has finished executing before returning. " +
+      "USAGE: Prefer this over repeated mgba_press_buttons calls for ANY multi-press action — menu navigation, dialogue advancement, movement paths, combos. Each press via mgba_press_buttons costs a full round-trip, so an 8-press menu sequence takes seconds of real time and the emulator sits idle between presses; here the whole sequence costs one round-trip and executes back-to-back at frame cadence. " +
+      "Entries are either a bare button name for the common single-button case ([\"A\",\"Right\",\"Up\",\"Up\",\"A\"]) or an object for combos and per-step timing ({\"buttons\":[\"Down\",\"B\"],\"frames\":4}); the two forms can be mixed in one sequence. Set `frames`/`release_frames` at the top level to change the default timing for every entry. " +
+      "Because it waits for completion by default, a following mgba_screenshot or memory read is guaranteed to observe the post-sequence state rather than catching the ROM mid-sequence — set `wait` false only for fire-and-forget input. " +
+      "BEHAVIOR: Modifies the bridge's input queue; presses fire on mGBA's frame callback in the order given. The ENTIRE sequence is validated before anything is queued, so an invalid button name at step 7 leaves the emulator untouched rather than half-executing steps 1-6. With `wait` true (default) the call polls the bridge until the queue drains, then returns; if the timeout expires first it returns normally and reports how many presses are still pending (the usual cause is paused emulation — the frame callback isn't running, so the queue can't drain). Note that presses already queued by earlier calls execute first, and their frames count toward the drain. Returns an error for an unknown button name, an empty sequence, more than 256 entries, or frames/release_frames below 1. " +
+      `RETURNS: Single line reporting the number of presses executed (or queued) and the total emulator frames consumed.\n\nValid button names: ${VALID_KEYS.join(", ")}.`,
+    inputSchema: {
+      type: "object",
+      required: ["presses"],
+      properties: {
+        presses: {
+          type: "array",
+          minItems: 1,
+          maxItems: 256,
+          items: {
+            oneOf: [
+              { type: "string", enum: VALID_KEYS, description: "A single button pressed on its own, using the sequence-level default timing." },
+              {
+                type: "object",
+                required: ["buttons"],
+                properties: {
+                  buttons: {
+                    type: "array",
+                    items: { type: "string", enum: VALID_KEYS },
+                    minItems: 1,
+                    description: "Buttons held SIMULTANEOUSLY for this one press (e.g. [\"Down\",\"B\"]). Case-sensitive; an unknown name aborts the whole sequence before anything is queued.",
+                  },
+                  frames: {
+                    type: "integer",
+                    minimum: 1,
+                    description: "Frames to hold this press, overriding the sequence default. Raise for a ROM that misses short taps during menu animations or text scroll.",
+                  },
+                  release_frames: {
+                    type: "integer",
+                    minimum: 1,
+                    description: "Frames to release all keys after this press, overriding the sequence default.",
+                  },
+                },
+              },
+            ],
+          },
+          description:
+            "Ordered list of presses, executed front to back. Mix bare button names (single-button presses) with objects (combos or custom timing) freely — e.g. [\"A\",\"Right\",{\"buttons\":[\"Down\",\"B\"],\"frames\":4},\"A\"]. Repeating the same name produces distinct presses, not one long hold, because release frames separate them.",
+        },
+        frames: {
+          type: "integer",
+          minimum: 1,
+          default: 1,
+          description:
+            "Default frames to hold each press, for entries that don't set their own (default 1). 2-4 is a safe menu-confirm tap; a 1-frame press can be missed by a ROM that skips input polling during animations or transitions.",
+        },
+        release_frames: {
+          type: "integer",
+          minimum: 1,
+          default: 1,
+          description:
+            "Default frames to release all keys between presses, for entries that don't set their own (default 1). This gap is what makes consecutive presses of the SAME button register as separate events; raise it to 2-4 for a ROM that debounces input.",
+        },
+        wait: {
+          type: "boolean",
+          default: true,
+          description:
+            "Wait for the queue to fully drain before returning (default true), so subsequent screenshots and memory reads see the finished state. Set false to return as soon as the sequence is queued — useful only when you intend to do other work while input plays out.",
+        },
+        timeout_ms: {
+          type: "integer",
+          minimum: 1,
+          description:
+            "Maximum milliseconds to wait when `wait` is true. Defaults to a generous allowance derived from the sequence length (roughly 50ms per frame plus 2s). On timeout the call still succeeds and reports the number of presses left pending rather than throwing.",
         },
       },
     },
@@ -452,6 +705,25 @@ function formatHex(n: unknown): string {
   return `${n} (0x${n.toString(16).toUpperCase()})`;
 }
 
+function hexAddr(n: number): string {
+  return `0x${n.toString(16).toUpperCase()}`;
+}
+
+// Poll the bridge until every queued press has fired. The bridge answers once
+// per frame callback, so a ~16ms poll interval matches its natural cadence.
+// Returns the number of presses still pending (0 on a clean drain) rather than
+// throwing on timeout — a stalled queue almost always means paused emulation,
+// which is worth reporting plainly instead of as an error.
+async function waitForInputDrain(mgba: MgbaClient, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const s = await mgba.call<{ pending: number }>("input_status");
+    if (s.pending === 0) return 0;
+    if (Date.now() >= deadline) return s.pending;
+    await new Promise((r) => setTimeout(r, 16));
+  }
+}
+
 // ── Registration ─────────────────────────────────────────────────────────────
 
 export function registerTools(server: Server, mgba: MgbaClient): void {
@@ -554,6 +826,115 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           `(hold ${p.frames ?? 1}f, release ${p.release_frames ?? 1}f). ` +
           `Queue size: ${r.queue_size}`,
         );
+      }
+
+      case "mgba_search_memory": {
+        const r = await mgba.call<{
+          count: number;
+          shown: number[];
+          truncated: boolean;
+          collect_capped: boolean;
+          stored_as?: string;
+          address: number;
+          length: number;
+        }>("search_memory", {
+          ...(p.value       !== undefined ? { value:       p.value }       : {}),
+          ...(p.width       !== undefined ? { width:       p.width }       : {}),
+          ...(p.bytes       !== undefined ? { bytes:       p.bytes }       : {}),
+          ...(p.text        !== undefined ? { text:        p.text }        : {}),
+          ...(p.region      !== undefined ? { region:      p.region }      : {}),
+          ...(p.address     !== undefined ? { address:     p.address }     : {}),
+          ...(p.length      !== undefined ? { length:      p.length }      : {}),
+          ...(p.align       !== undefined ? { align:       p.align }       : {}),
+          ...(p.candidates  !== undefined ? { candidates:  p.candidates }  : {}),
+          ...(p.store_as    !== undefined ? { store_as:    p.store_as }    : {}),
+          ...(p.max_results !== undefined ? { max_results: p.max_results } : {}),
+        });
+
+        const term =
+          p.text !== undefined  ? `text ${JSON.stringify(p.text)}` :
+          p.bytes !== undefined ? `${(p.bytes as number[]).length} byte pattern` :
+          `${formatHex(p.value)} @ ${p.width ?? 4}-byte`;
+        const scope = p.candidates
+          ? `candidate set "${p.candidates}"`
+          : `${p.region ?? hexAddr(r.address)} [${r.length} bytes]`;
+
+        const lines = [`Searched ${scope} for ${term} — ${r.count} match(es).`];
+        if (r.stored_as) lines.push(`Stored as "${r.stored_as}" (full set, narrow it with candidates="${r.stored_as}").`);
+        if (r.count > 0) lines.push(r.shown.map(hexAddr).join("  "));
+        if (r.truncated) lines.push(`(showing first ${r.shown.length} of ${r.count})`);
+        if (r.collect_capped) lines.push("WARNING: hit the 100000-match retention cap — narrow the region or widen the search term.");
+        return ok(lines.join("\n"));
+      }
+
+      case "mgba_snapshot_memory": {
+        const r = await mgba.call<{ name: string; address: number; length: number }>("snapshot_memory", {
+          name: p.name,
+          ...(p.region  !== undefined ? { region:  p.region }  : {}),
+          ...(p.address !== undefined ? { address: p.address } : {}),
+          ...(p.length  !== undefined ? { length:  p.length }  : {}),
+        });
+        return ok(`Snapshot "${r.name}": ${r.length} bytes at ${hexAddr(r.address)}`);
+      }
+
+      case "mgba_diff_memory": {
+        const r = await mgba.call<{
+          name: string;
+          address: number;
+          length: number;
+          predicate: string;
+          width: number;
+          count: number;
+          changes: { address: number; before: number; after: number }[];
+          truncated: boolean;
+          collect_capped: boolean;
+          stored_as?: string;
+          refreshed: boolean;
+        }>("diff_memory", {
+          name: p.name,
+          ...(p.predicate   !== undefined ? { predicate:   p.predicate }   : {}),
+          ...(p.value       !== undefined ? { value:       p.value }       : {}),
+          ...(p.width       !== undefined ? { width:       p.width }       : {}),
+          ...(p.align       !== undefined ? { align:       p.align }       : {}),
+          ...(p.store_as    !== undefined ? { store_as:    p.store_as }    : {}),
+          ...(p.refresh     !== undefined ? { refresh:     p.refresh }     : {}),
+          ...(p.max_results !== undefined ? { max_results: p.max_results } : {}),
+        });
+
+        const lines = [
+          `Diff "${r.name}" ${hexAddr(r.address)} [${r.length} bytes] ` +
+          `predicate=${r.predicate} width=${r.width} — ${r.count} match(es).`,
+        ];
+        if (r.stored_as) lines.push(`Stored as "${r.stored_as}".`);
+        if (r.refreshed) lines.push("Snapshot re-baselined to current contents.");
+        for (const c of r.changes) {
+          lines.push(`  ${hexAddr(c.address)}: ${formatHex(c.before)} → ${formatHex(c.after)}`);
+        }
+        if (r.truncated) lines.push(`(showing first ${r.changes.length} of ${r.count})`);
+        if (r.collect_capped) lines.push("WARNING: hit the 100000-match retention cap — narrow the region or use a more selective predicate.");
+        return ok(lines.join("\n"));
+      }
+
+      case "mgba_press_sequence": {
+        const r = await mgba.call<{ queued: number; queue_size: number; frames: number }>("press_sequence", {
+          presses: p.presses,
+          ...(p.frames         !== undefined ? { frames:         p.frames }         : {}),
+          ...(p.release_frames !== undefined ? { release_frames: p.release_frames } : {}),
+        });
+
+        if (p.wait === false) {
+          return ok(`Queued ${r.queued} press(es), ${r.frames} frames. Queue size: ${r.queue_size}`);
+        }
+
+        const timeout = (p.timeout_ms as number | undefined) ?? r.frames * 50 + 2000;
+        const pending = await waitForInputDrain(mgba, timeout);
+        if (pending > 0) {
+          return ok(
+            `Queued ${r.queued} press(es), ${r.frames} frames — but ${pending} still pending after ${timeout}ms. ` +
+            `Is emulation paused? The queue only drains while frames are running.`,
+          );
+        }
+        return ok(`Executed ${r.queued} press(es) over ${r.frames} frames.`);
       }
 
       case "mgba_advance_frames": {
