@@ -859,10 +859,13 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           ? `candidate set "${p.candidates}"`
           : `${p.region ?? hexAddr(r.address)} [${r.length} bytes]`;
 
+        // Same empty-table-as-object caveat as diff_memory: normalise before use.
+        const shown = Array.isArray(r.shown) ? r.shown : [];
+
         const lines = [`Searched ${scope} for ${term} — ${r.count} match(es).`];
         if (r.stored_as) lines.push(`Stored as "${r.stored_as}" (full set, narrow it with candidates="${r.stored_as}").`);
-        if (r.count > 0) lines.push(r.shown.map(hexAddr).join("  "));
-        if (r.truncated) lines.push(`(showing first ${r.shown.length} of ${r.count})`);
+        if (shown.length > 0) lines.push(shown.map(hexAddr).join("  "));
+        if (r.truncated) lines.push(`(showing first ${shown.length} of ${r.count})`);
         if (r.collect_capped) lines.push("WARNING: hit the 100000-match retention cap — narrow the region or widen the search term.");
         return ok(lines.join("\n"));
       }
@@ -901,16 +904,22 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           ...(p.max_results !== undefined ? { max_results: p.max_results } : {}),
         });
 
+        // json.lua encodes an empty Lua table as `{}`, not `[]`, so a zero-match
+        // diff arrives as an object rather than an array. Normalise before use —
+        // "nothing changed" is a perfectly ordinary (and often informative) result
+        // and must not throw.
+        const changes = Array.isArray(r.changes) ? r.changes : [];
+
         const lines = [
           `Diff "${r.name}" ${hexAddr(r.address)} [${r.length} bytes] ` +
           `predicate=${r.predicate} width=${r.width} — ${r.count} match(es).`,
         ];
         if (r.stored_as) lines.push(`Stored as "${r.stored_as}".`);
         if (r.refreshed) lines.push("Snapshot re-baselined to current contents.");
-        for (const c of r.changes) {
+        for (const c of changes) {
           lines.push(`  ${hexAddr(c.address)}: ${formatHex(c.before)} → ${formatHex(c.after)}`);
         }
-        if (r.truncated) lines.push(`(showing first ${r.changes.length} of ${r.count})`);
+        if (r.truncated) lines.push(`(showing first ${changes.length} of ${r.count})`);
         if (r.collect_capped) lines.push("WARNING: hit the 100000-match retention cap — narrow the region or use a more selective predicate.");
         return ok(lines.join("\n"));
       }
