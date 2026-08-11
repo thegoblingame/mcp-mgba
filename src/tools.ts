@@ -348,6 +348,11 @@ const TOOLS: Tool[] = [
           description:
             "Name of a previously stored candidate set to narrow instead of scanning fresh. Only the addresses in that set are re-tested against the new search term, and the set's own region is reused. This is the iterative-narrowing step — the fast way to pin down a value you can watch change on screen.",
         },
+        exclude: {
+          type: "string",
+          description:
+            "Name of a stored set whose addresses should be SUBTRACTED from the results (the inverse of `candidates`, and usable together with it). Use it to cancel noise: snapshot a region, diff it while changing nothing to capture the addresses that move on their own, store that as the noise floor, then exclude it. This is what makes hot regions like IWRAM searchable at all — they rewrite thousands of bytes per frame from stack and scratch use, which otherwise buries any real signal. Exclusion is applied before `store_as`, so a stored set is already clean.",
+        },
         store_as: {
           type: "string",
           description:
@@ -435,6 +440,11 @@ const TOOLS: Tool[] = [
           type: "integer",
           minimum: 1,
           description: "Only test addresses that are a multiple of this (defaults to `width`). Set to 1 to catch unaligned fields at the cost of more false positives.",
+        },
+        exclude: {
+          type: "string",
+          description:
+            "Name of a stored set whose addresses should be SUPPRESSED from this diff, and not counted toward `count`. The standard noise-cancellation workflow: snapshot the region, diff it immediately while changing nothing (that result IS the set of addresses that churn on their own), store it via `store_as`, then perform the real action and diff again with `exclude` naming it. Essential for IWRAM and any region containing animation counters, RNG, or frame timers.",
         },
         store_as: {
           type: "string",
@@ -834,6 +844,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           shown: number[];
           truncated: boolean;
           collect_capped: boolean;
+          excluded: number;
           stored_as?: string;
           address: number;
           length: number;
@@ -847,6 +858,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           ...(p.length      !== undefined ? { length:      p.length }      : {}),
           ...(p.align       !== undefined ? { align:       p.align }       : {}),
           ...(p.candidates  !== undefined ? { candidates:  p.candidates }  : {}),
+          ...(p.exclude     !== undefined ? { exclude:     p.exclude }     : {}),
           ...(p.store_as    !== undefined ? { store_as:    p.store_as }    : {}),
           ...(p.max_results !== undefined ? { max_results: p.max_results } : {}),
         });
@@ -863,6 +875,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
         const shown = Array.isArray(r.shown) ? r.shown : [];
 
         const lines = [`Searched ${scope} for ${term} — ${r.count} match(es).`];
+        if (r.excluded > 0) lines.push(`Suppressed ${r.excluded} address(es) via exclude="${p.exclude}".`);
         if (r.stored_as) lines.push(`Stored as "${r.stored_as}" (full set, narrow it with candidates="${r.stored_as}").`);
         if (shown.length > 0) lines.push(shown.map(hexAddr).join("  "));
         if (r.truncated) lines.push(`(showing first ${shown.length} of ${r.count})`);
@@ -891,6 +904,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           changes: { address: number; before: number; after: number }[];
           truncated: boolean;
           collect_capped: boolean;
+          excluded: number;
           stored_as?: string;
           refreshed: boolean;
         }>("diff_memory", {
@@ -899,6 +913,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           ...(p.value       !== undefined ? { value:       p.value }       : {}),
           ...(p.width       !== undefined ? { width:       p.width }       : {}),
           ...(p.align       !== undefined ? { align:       p.align }       : {}),
+          ...(p.exclude     !== undefined ? { exclude:     p.exclude }     : {}),
           ...(p.store_as    !== undefined ? { store_as:    p.store_as }    : {}),
           ...(p.refresh     !== undefined ? { refresh:     p.refresh }     : {}),
           ...(p.max_results !== undefined ? { max_results: p.max_results } : {}),
@@ -914,6 +929,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
           `Diff "${r.name}" ${hexAddr(r.address)} [${r.length} bytes] ` +
           `predicate=${r.predicate} width=${r.width} — ${r.count} match(es).`,
         ];
+        if (r.excluded > 0) lines.push(`Suppressed ${r.excluded} noisy address(es) via exclude="${p.exclude}".`);
         if (r.stored_as) lines.push(`Stored as "${r.stored_as}".`);
         if (r.refreshed) lines.push("Snapshot re-baselined to current contents.");
         for (const c of changes) {

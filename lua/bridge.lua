@@ -303,9 +303,29 @@ local function scan_region(data, base, needle, align)
     return hits, capped
 end
 
+-- Build an O(1) lookup from a stored set, for subtracting known-noisy addresses.
+--
+-- This is what makes hot regions searchable at all. IWRAM rewrites thousands of
+-- bytes every frame (stack, scratch), so "what changed when I did X" is buried in
+-- self-churn. The workflow this enables:
+--
+--   snapshot("base")                       -- capture
+--   diff("base", store_as="noise")         -- change nothing; this IS the noise floor
+--   <perform the action>
+--   diff("base", exclude="noise")          -- signal only
+local function build_exclude(name)
+    if not name then return nil end
+    local set = search_sets[name]
+    if not set then error("unknown exclude set: " .. tostring(name)) end
+    local lookup = {}
+    for _, a in ipairs(set.addrs) do lookup[a] = true end
+    return lookup
+end
+
 local function cmd_search_memory(p)
     local needle, width, kind = build_needle(p)
     local align = p.align or (kind == "value" and width or 1)
+    local excl = build_exclude(p.exclude)
     local base, len, hits, capped
 
     if p.candidates then
@@ -328,6 +348,17 @@ local function cmd_search_memory(p)
         hits, capped = scan_region(read_region(base, len), base, needle, align)
     end
 
+    -- Subtract the exclude set BEFORE storing, so a stored set is already clean
+    -- and can be narrowed further without re-excluding each time.
+    local excluded = 0
+    if excl then
+        local kept = {}
+        for _, a in ipairs(hits) do
+            if excl[a] then excluded = excluded + 1 else kept[#kept + 1] = a end
+        end
+        hits = kept
+    end
+
     if p.store_as then
         search_sets[p.store_as] = { address = base, length = len, addrs = hits }
     end
@@ -339,6 +370,7 @@ local function cmd_search_memory(p)
         shown      = shown,
         truncated  = #hits > #shown,
         collect_capped = capped,
+        excluded   = excluded,
         stored_as  = p.store_as,
         address    = base,
         length     = len,
@@ -367,10 +399,11 @@ local function cmd_diff_memory(p)
     local target
     if pred == "equals" then target = assert(p.value, "value required for predicate 'equals'") end
     local align = p.align or width
+    local excl  = build_exclude(p.exclude)
 
     local old, new = snap.data, read_region(snap.address, snap.length)
     local len = #old
-    local hits, total, capped = {}, 0, false
+    local hits, total, capped, excluded = {}, 0, false, 0
 
     local bstart = 0
     while bstart < len do
@@ -399,7 +432,11 @@ local function cmd_diff_memory(p)
                 elseif pred == "decreased" then match = n < o
                 else                            match = n == target
                 end
-                if match then
+                if match and excl and excl[snap.address + i] then
+                    -- Known-noisy address: suppressed, and not counted in `count`,
+                    -- so the reported total reflects signal rather than churn.
+                    excluded = excluded + 1
+                elseif match then
                     total = total + 1
                     if total <= COLLECT_CAP then
                         hits[#hits + 1] = { address = snap.address + i, before = o, after = n }
@@ -434,6 +471,7 @@ local function cmd_diff_memory(p)
         changes   = shown,
         truncated = total > #shown,
         collect_capped = capped,
+        excluded  = excluded,
         stored_as = p.store_as,
         refreshed = p.refresh and true or false,
     }
