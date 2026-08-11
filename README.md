@@ -149,7 +149,11 @@ The server speaks standard MCP over stdio. Run `mcp-mgba` (or `node dist/index.j
 | `mgba_write8` / `mgba_write16` / `mgba_write32` | Write to RAM |
 | `mgba_read_range` | Read up to 4096 bytes as a byte array |
 | `mgba_write_range` | Write up to 4096 bytes from a byte array |
+| `mgba_search_memory` | Scan a region for a value, byte pattern, or ASCII string — **runs inside the emulator** |
+| `mgba_snapshot_memory` | Capture a region into a named buffer held inside the bridge |
+| `mgba_diff_memory` | Compare a named snapshot against current memory and report what changed |
 | `mgba_press_buttons` | Queue a button press (FIFO; consecutive calls produce distinct events) |
+| `mgba_press_sequence` | Queue a whole ordered sequence of presses in one call, waiting for it to finish |
 | `mgba_advance_frames` | Step the emulator N frames |
 | `mgba_pause` / `mgba_unpause` | Pause / resume emulation |
 | `mgba_reset` | Reset the loaded ROM |
@@ -157,6 +161,50 @@ The server speaks standard MCP over stdio. Run `mcp-mgba` (or `node dist/index.j
 | `mgba_save_state` / `mgba_load_state` | Save/load emulator state to a slot or path |
 
 See [`docs/RECIPES.md`](docs/RECIPES.md) for end-to-end examples (RAM hunting, snapshot-experiment-restore, side-scroller automation, etc.).
+
+### Finding an unknown address
+
+`search_memory` / `snapshot_memory` / `diff_memory` run the scan *inside* mGBA, so only results
+cross the wire. A full 256 KiB EWRAM sweep is one call rather than 64 `read_range` calls, and
+there's no 4096-byte cap.
+
+Three composable ideas make this practical:
+
+**Narrow the region.** By far the highest-leverage habit. The same in-game event produced **9**
+changes over a 6 KB struct versus **3,922** over all of EWRAM. If you can guess which struct holds
+the value, snapshot only that.
+
+**Narrow by repetition (`candidates`).** `store_as` keeps a result set inside the bridge, so a
+first pass matching tens of thousands of addresses costs nothing to carry forward. Re-search with
+`candidates` to intersect after the value changes on screen:
+
+```
+search_memory(value=200, region="EWRAM", width=2, store_as="gold")   -> 4213 hits
+  ... spend gold in game ...
+search_memory(value=150, candidates="gold", store_as="gold")         -> 3 hits
+```
+
+**Narrow by subtraction (`exclude`).** Some regions rewrite themselves every frame — IWRAM (stack
+and scratch), animation counters, RNG, frame timers. Capture that churn as a noise floor and
+subtract it:
+
+```
+snapshot_memory(name="base", region="IWRAM")
+diff_memory(name="base", store_as="noise")     # change nothing -- this IS the floor
+  ... perform the action ...
+diff_memory(name="base", exclude="noise")      # signal only
+```
+
+Without this, a single IWRAM diff can return thousands of hits that are all self-churn. Both tools
+report how many addresses they suppressed, so an `exclude` set that is doing nothing — or
+swallowing everything — is visible rather than silent.
+
+Two caveats worth knowing up front:
+
+- **`diff_memory` predicates** (`increased` / `decreased` / `equals` / `unchanged`) are usually more
+  selective than plain `changed`. Reach for a directional predicate first when you know which way
+  the on-screen value moved.
+- **Stored sets and snapshots live in Lua state**, so reloading `bridge.lua` clears them all.
 
 ### GBA button names
 
@@ -187,6 +235,9 @@ See [`docs/RECIPES.md`](docs/RECIPES.md) for end-to-end examples (RAM hunting, s
 | `emu:foo not available on this mGBA build` for `pause`, `unpause`, `frameAdvance`, etc. | This particular build of mGBA doesn't expose that method. The bridge feature-detects on the first frame; check `mgba_get_info` for the full capabilities map. For `frameAdvance`, the bridge falls back to `runFrame` then `step` automatically. |
 | `read8/16/32` returns "invoking failed" intermittently | Known mGBA Lua quirk — the typed read methods are flaky via pcall from the frame callback. The bridge already routes `read8/16/32` through the more reliable `readRange` internally; if you still see this on a write, the retry loop usually clears it within a few attempts. |
 | Multiple `press_buttons` calls don't seem to register as distinct events | Older `mgba_press_buttons` (≤0.1.0) had this bug; v0.2.0+ uses a FIFO queue. Make sure you've upgraded with `npm install -g mcp-mgba` and restarted your MCP client. |
+| `unknown candidate set` / `unknown exclude set` / `unknown snapshot` | Stored sets and snapshots live in the Lua script's state, so **reloading `bridge.lua` clears them all**. Re-capture the snapshot and re-run the search. |
+| `diff_memory` returns thousands of hits for a small action | You're diffing a region that rewrites itself independently — IWRAM, or anything holding animation counters, RNG, or frame timers. Capture a noise floor and pass `exclude=` (see *Finding an unknown address*), and narrow the region while you're at it. |
+| `press_sequence` returns "N still pending" | The queue only drains while frames are running. Emulation is paused, or the game is sitting on a modal that swallows input. Note that the call waits for the *input queue* to empty — not for the game to finish reacting, which can take much longer (an enemy phase, a battle animation). |
 
 ## Development
 
