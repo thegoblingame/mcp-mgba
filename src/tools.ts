@@ -5,6 +5,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { MgbaClient } from "./mgba.js";
+import { FE7_TOOLS, handleFe7 } from "./fe7.js";
 
 // Address-space cheat sheets (used in tool descriptions). The bridge works on
 // any platform mGBA supports; users running GB/GBC ROMs need a different map.
@@ -737,11 +738,19 @@ async function waitForInputDrain(mgba: MgbaClient, timeoutMs: number): Promise<n
 // ── Registration ─────────────────────────────────────────────────────────────
 
 export function registerTools(server: Server, mgba: MgbaClient): void {
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...TOOLS, ...FE7_TOOLS] }));
 
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const { name, arguments: args = {} } = req.params;
     const p = args as Record<string, unknown>;
+
+    // Game-specific FE7 layer. Returns null for anything it doesn't own, so the
+    // generic tools below stay authoritative for their own names.
+    if (name.startsWith("fe7_")) {
+      const handled = await handleFe7(name, p, mgba);
+      if (handled) return handled;
+      throw new Error(`Unknown tool: ${name}`);
+    }
 
     switch (name) {
       case "mgba_ping": {
