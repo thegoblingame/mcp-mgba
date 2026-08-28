@@ -36,6 +36,33 @@ const A = {
   greenArray:   0x0202dcd0, // NPC / green faction, roster indices 0x41+
   textBuf:      0x0202a5b4, // decoded ASCII staging buffer
   gridData:     0x030004ac, // movement grid row data (IWRAM)
+  battleActor:  0x0203a3f0, // gBattleActor  — 128-byte BattleUnit
+  battleTarget: 0x0203a470, // gBattleTarget — 128-byte BattleUnit
+  uiArena:      0x02024000, // where menus and selection procs get allocated
+} as const;
+
+const UI_ARENA_LEN = 8192;
+
+// ROM item table: entry = ITEM_TABLE + 0x24*id.
+//   +0x07 weapon type (0 sword 1 lance 2 axe 3 bow 4 staff 5 anima 6 light 7 dark, 9 consumable)
+//   +0x14 max uses, +0x15 Mt, +0x16 Hit, +0x17 Wt, +0x18 Crit, +0x19 range (hi nibble max, lo min)
+const ITEM_TABLE  = 0x08be222c;
+const ITEM_STRIDE = 0x24;
+const WTYPE_STAFF = 4;
+
+// The staff-targeting proc carries this ROM script pointer at its +0x00, and the
+// highlighted target's unit-struct pointer at +0x2C. Searching for it returns
+// exactly one match while staff target select is up and zero otherwise, so it is
+// both the readback AND the state gate. The proc address itself is dynamic.
+const STAFF_PROC_SIG = [0x98, 0x69, 0xb9, 0x08];
+const STAFF_PROC_TARGET_OFF = 0x2c;
+
+// Battle-copy field offsets (u16 unless noted). See RAM.md "Combat forecast".
+const BF = {
+  weaponAfter: 0x48, weaponBefore: 0x4a, wtype: 0x50,
+  triHit: 0x53, triDmg: 0x54, terrainId: 0x55, terrainDef: 0x56, terrainAvo: 0x57,
+  atk: 0x5a, def: 0x5c, as: 0x5e, hit: 0x60, avo: 0x62,
+  effHit: 0x64, crit: 0x66, dodge: 0x68, effCrit: 0x6a,
 } as const;
 
 const UNIT_STRIDE  = 0x48;
@@ -126,6 +153,8 @@ export interface Unit {
   deployed: boolean;
   dead: boolean;
   items: Array<{ id: number; uses: number }>;
+  /** Weapon ranks at +0x28, indexed by weapon type. 0 = cannot use that type at all. */
+  ranks: number[];
 }
 
 function decodeUnit(b: number[], base: number, slot: number, arrayAddr: number): Unit | null {
@@ -171,6 +200,7 @@ function decodeUnit(b: number[], base: number, slot: number, arrayAddr: number):
     deployed: b[o + 0x10] !== 0xff,
     dead: b[o + 0x13] === 0,
     items,
+    ranks: Array.from({ length: 8 }, (_, i) => b[o + 0x28 + i]),
   };
 }
 
@@ -327,6 +357,316 @@ async function commitWait(m: MgbaClient, arrayAddr: number, slot: number, attemp
   return false;
 }
 
+// ── ASCII staging buffer ───────────────────────────────────────────────────
+//
+// NOT a menu-highlight mirror — it holds the last string the game RENDERED, and
+// it goes stale. It read "Wait" at index 2 of 4 AND at index 0 of 4, so it can
+// never be used to tell which entry is highlighted. It IS reliable for prompts
+// that only appear in one state ("Select a character to restore HP to.") and for
+// refusals ("There's no need for that."), which is all we use it for.
+
+async function readText(m: MgbaClient, len = 64): Promise<string> {
+  const b = await readRange(m, A.textBuf, len);
+  let out = "";
+  for (const c of b) {
+    if (c === 0) break;
+    out += c >= 0x20 && c < 0x7f ? String.fromCharCode(c) : ".";
+  }
+  return out;
+}
+
+// ── ROM item table ─────────────────────────────────────────────────────────
+
+const itemTypeCache = new Map<number, number>();
+
+/** Weapon type of an item id. 4 = staff. Cached; the table is in ROM and never moves. */
+async function itemType(m: MgbaClient, id: number): Promise<number> {
+  const hit = itemTypeCache.get(id);
+  if (hit !== undefined) return hit;
+  const b = await readRange(m, ITEM_TABLE + ITEM_STRIDE * id, 8);
+  const t = b[0x07];
+  itemTypeCache.set(id, t);
+  return t;
+}
+
+/** Min/max attack range of an item, from the ROM table's packed range nibbles. */
+async function itemRange(m: MgbaClient, id: number): Promise<{ min: number; max: number }> {
+  const b = await readRange(m, ITEM_TABLE + ITEM_STRIDE * id + 0x19, 1);
+  return { min: b[0] & 0x0f, max: (b[0] >> 4) & 0x0f };
+}
+
+/** Inventory slot indices holding staves, in inventory order = the staff list's order. */
+async function staffSlots(m: MgbaClient, u: Unit): Promise<number[]> {
+  const out: number[] = [];
+  for (let i = 0; i < u.items.length; i++) {
+    if ((await itemType(m, u.items[i].id)) === WTYPE_STAFF) out.push(i);
+  }
+  return out;
+}
+
+// ── Combat forecast ────────────────────────────────────────────────────────
+
+export interface BattleSide {
+  atk: number; def: number; as: number; hit: number; avo: number;
+  effHit: number; crit: number; dodge: number; effCrit: number;
+  weaponId: number; usesBefore: number; usesAfter: number;
+  wtype: number; terrainDef: number; terrainAvo: number;
+  hpNow: number; projHp: number;
+}
+
+function decodeSide(b: number[], o: number): BattleSide {
+  const before = u16(b, o + BF.weaponBefore);
+  const after  = u16(b, o + BF.weaponAfter);
+  return {
+    atk: u16(b, o + BF.atk), def: u16(b, o + BF.def), as: u16(b, o + BF.as),
+    hit: u16(b, o + BF.hit), avo: u16(b, o + BF.avo),
+    effHit: u16(b, o + BF.effHit), crit: u16(b, o + BF.crit),
+    dodge: u16(b, o + BF.dodge), effCrit: u16(b, o + BF.effCrit),
+    weaponId: before & 0xff, usesBefore: (before >> 8) & 0xff, usesAfter: (after >> 8) & 0xff,
+    wtype: b[o + BF.wtype], terrainDef: b[o + BF.terrainDef], terrainAvo: b[o + BF.terrainAvo],
+    hpNow: b[o + 0x72], projHp: b[o + 0x13],
+  };
+}
+
+/**
+ * The forecast structs are STALE GARBAGE outside a live forecast — they are not
+ * cleared between battles, so a plain read always returns believable numbers.
+ * gBattleTarget's class pointer at +0x04 is the documented gate: zero means the
+ * pair has not been populated for this selection yet.
+ */
+async function forecastLive(m: MgbaClient): Promise<boolean> {
+  const b = await readRange(m, A.battleTarget + 0x04, 4);
+  return u32(b, 0) !== 0;
+}
+
+async function readForecast(m: MgbaClient): Promise<{ actor: BattleSide; target: BattleSide }> {
+  const b = await readRange(m, A.battleActor, 0x100);
+  return { actor: decodeSide(b, 0x00), target: decodeSide(b, 0x80) };
+}
+
+/** Attack count for one side: uses(before) - uses(after). 2 means it doubles. */
+const blows = (s: BattleSide) => Math.max(0, s.usesBefore - s.usesAfter);
+
+function formatSide(label: string, s: BattleSide, oppDef: number): string {
+  const dmg = Math.max(0, s.atk - oppDef);
+  const n = blows(s);
+  return (
+    `${label}: dmg ${dmg} x${n} (ATK ${s.atk} - DEF ${oppDef})  hit ${s.effHit}%  crit ${s.effCrit}%  ` +
+    `AS ${s.as}  avo ${s.avo}  ddg ${s.dodge}`
+  );
+}
+
+// ── Locating things that move ──────────────────────────────────────────────
+
+const asArray = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+
+/** Is this a plausible live unit-struct address (any of the three arrays)? */
+function unitRefFromAddr(addr: number): { array: number; slot: number } | null {
+  for (const base of [A.playerArray, A.enemyArray, A.greenArray]) {
+    const cap = SLOT_CAP[base] ?? 0;
+    if (addr >= base && addr < base + cap * UNIT_STRIDE && (addr - base) % UNIT_STRIDE === 0) {
+      return { array: base, slot: (addr - base) / UNIT_STRIDE };
+    }
+  }
+  return null;
+}
+
+/**
+ * Find the live menu by behaviour, never by address — the same logical menu lands
+ * in a different arena slot almost every time, and stale copies survive at the old
+ * addresses looking perfectly plausible.
+ *
+ * Presses Down (the index byte and its mirror move together as an adjacent pair),
+ * then presses Up to put the highlight back where it was.
+ *
+ * DIFF TWICE: press_sequence returns when the input queue drains, not when the
+ * game has settled, so the first diff routinely catches a mid-transition frame —
+ * 30-70 bytes of sprite churn with no pair in sight. The second returns the
+ * settled 4-7 with the pair obvious.
+ */
+async function locateMenu(m: MgbaClient): Promise<{ addr: number; count: number; index: number } | null> {
+  await m.call("snapshot_memory", { name: "fe7_menu", address: A.uiArena, length: UI_ARENA_LEN });
+  await press(m, [{ buttons: ["Down"], frames: 4, release_frames: 16 }]);
+
+  let changes: Array<{ address: number; before: number; after: number }> = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await sleep(attempt === 0 ? 110 : 180);
+    const r = await m.call<{ changes: unknown }>("diff_memory", {
+      name: "fe7_menu", predicate: "changed", width: 1, max_results: 256,
+    });
+    changes = asArray<{ address: number; before: number; after: number }>(r.changes);
+    if (changes.length > 0 && changes.length < 40) break;
+  }
+
+  // The index byte and its mirror move TOGETHER, so require both to show the
+  // identical before/after transition. Sprite churn produces plenty of adjacent
+  // changed bytes, but almost never a matched pair with a sane count in front.
+  const byAddr = new Map(changes.map((c) => [c.address, c]));
+  const cands: Array<{ addr: number; count: number; vDown: number }> = [];
+  for (const c of changes) {
+    const mirror = byAddr.get(c.address + 1);
+    if (!mirror || mirror.before !== c.before || mirror.after !== c.after) continue;
+    const b = await readRange(m, c.address - 1, 1);
+    const count = b[0];
+    if (count >= 2 && count <= 10 && c.after < count) cands.push({ addr: c.address, count, vDown: c.after });
+  }
+
+  // CONFIRM BY EFFECT. A pattern match is not enough — an earlier version of this
+  // accepted a bogus 8-entry "menu", and the caller then drove Down/A against the
+  // real menu and committed Wait, silently costing a unit its turn. So undo the
+  // Down and require the candidate to move back exactly as a wrapping index must.
+  await press(m, [{ buttons: ["Up"], frames: 4, release_frames: 16 }]);
+  await sleep(120);
+
+  for (const c of cands) {
+    const b = await readRange(m, c.addr - 1, 3);
+    const [count2, vUp, mirror2] = b;
+    if (count2 !== c.count || vUp !== mirror2) continue;
+    if (vUp !== (c.vDown - 1 + c.count) % c.count) continue;
+    return { addr: c.addr, count: c.count, index: vUp };
+  }
+  return null;
+}
+
+/** Move a menu highlight from its current index to `to`, wrapping downward. */
+async function menuGoTo(m: MgbaClient, menuAddr: number, to: number, count: number): Promise<boolean> {
+  for (let guard = 0; guard < count + 2; guard++) {
+    const b = await readRange(m, menuAddr, 1);
+    if (b[0] === to) return true;
+    await press(m, [{ buttons: ["Down"], frames: 4, release_frames: 16 }]);
+    await sleep(60);
+  }
+  const b = await readRange(m, menuAddr, 1);
+  return b[0] === to;
+}
+
+/**
+ * Which unit is highlighted in a unit-target selection (staff target, trade
+ * partner, rescue target, attack target).
+ *
+ * Two mechanisms. The staff proc signature is exact and side-effect free, so it
+ * is tried first. The general form costs a Right press — it finds the 4-byte
+ * slot holding the highlighted unit's struct address by seeing what moves — and
+ * then a Left to put the highlight back.
+ *
+ * Do NOT reach for a remembered offset instead: the trade proc's +0x28 holds the
+ * INITIAL partner and then goes stale, staying put across three Right presses
+ * while the real highlight moved twice. Location is not semantics.
+ */
+async function findTargetPointerAddr(m: MgbaClient): Promise<number | null> {
+  const r = await m.call<{ count: number; shown: unknown }>("search_memory", {
+    bytes: STAFF_PROC_SIG, region: "EWRAM", align: 4, max_results: 8,
+  });
+  const shown = asArray<number>(r.shown);
+  if (r.count === 1 && shown.length === 1) return shown[0] + STAFF_PROC_TARGET_OFF;
+
+  await m.call("snapshot_memory", { name: "fe7_tgt", address: A.uiArena, length: UI_ARENA_LEN });
+  await press(m, [{ buttons: ["Right"], frames: 4, release_frames: 18 }]);
+  let hit: number | null = null;
+  for (let attempt = 0; attempt < 3 && hit === null; attempt++) {
+    await sleep(attempt === 0 ? 90 : 160);
+    const d = await m.call<{ changes: unknown }>("diff_memory", {
+      name: "fe7_tgt", predicate: "changed", width: 4, max_results: 256,
+    });
+    for (const c of asArray<{ address: number; before: number; after: number }>(d.changes)) {
+      if (unitRefFromAddr(c.before >>> 0) && unitRefFromAddr(c.after >>> 0)) { hit = c.address; break; }
+    }
+  }
+  await press(m, [{ buttons: ["Left"], frames: 4, release_frames: 18 }]);
+  return hit;
+}
+
+/**
+ * Which unit the attack forecast is currently aimed at.
+ *
+ * gBattleTarget embeds a COPY of the target's unit struct, so its tile, roster
+ * index and max HP identify the selection outright — no proc search, no diff, no
+ * side effects. This is strictly better than the generic pointer hunt for attacks,
+ * where the generic hunt can also come up empty: with only one enemy in range a
+ * Right press changes nothing, so there is no delta to find.
+ *
+ * Match on the TILE. +0x13 in this copy is the projected post-battle HP, not the
+ * current HP, so matching on HP would fail exactly when the target is about to die.
+ */
+async function battleTargetTile(m: MgbaClient): Promise<{ x: number; y: number; maxHp: number; roster: number } | null> {
+  if (!(await forecastLive(m))) return null;
+  const b = await readRange(m, A.battleTarget, 0x14);
+  return { x: b[0x10], y: b[0x11], maxHp: b[0x12], roster: b[0x0b] };
+}
+
+/** Cycle attack targets with Right until the forecast is aimed at `want`. */
+async function cycleToEnemyTile(
+  m: MgbaClient, wantX: number, wantY: number, maxSteps = 12,
+): Promise<{ ok: boolean; landedX: number; landedY: number } | null> {
+  let last: { x: number; y: number } | null = null;
+  for (let i = 0; i <= maxSteps; i++) {
+    const t = await battleTargetTile(m);
+    if (!t) return null;
+    last = t;
+    if (t.x === wantX && t.y === wantY) return { ok: true, landedX: t.x, landedY: t.y };
+    await press(m, [{ buttons: ["Right"], frames: 4, release_frames: 18 }]);
+    await sleep(90);
+  }
+  return { ok: false, landedX: last?.x ?? -1, landedY: last?.y ?? -1 };
+}
+
+async function readTargetRef(m: MgbaClient, ptrAddr: number): Promise<{ array: number; slot: number } | null> {
+  const b = await readRange(m, ptrAddr, 4);
+  return unitRefFromAddr(u32(b, 0));
+}
+
+/** Cycle a target selection with Right until it lands on `want`, verifying each step. */
+async function cycleToTarget(
+  m: MgbaClient, ptrAddr: number, wantArray: number, wantSlot: number, maxSteps = 12,
+): Promise<boolean> {
+  for (let i = 0; i <= maxSteps; i++) {
+    const ref = await readTargetRef(m, ptrAddr);
+    if (ref && ref.array === wantArray && ref.slot === wantSlot) return true;
+    await press(m, [{ buttons: ["Right"], frames: 4, release_frames: 18 }]);
+    await sleep(70);
+  }
+  const ref = await readTargetRef(m, ptrAddr);
+  return !!ref && ref.array === wantArray && ref.slot === wantSlot;
+}
+
+/**
+ * Press B until the unit is back where it started, unselected and unspent.
+ *
+ * Every pre-commit screen (Attack, Staff, Item, Rescue, Trade and their target
+ * selections) unwinds with B; only Wait commits. Backing all the way out also
+ * returns the unit to its origin tile, so a forecast leaves no trace.
+ */
+async function unwind(m: MgbaClient, slot: number, startX: number, startY: number, presses = 6): Promise<boolean> {
+  for (let i = 0; i < presses; i++) {
+    const v = await readUnit(m, A.playerArray, slot);
+    if (v && !v.selected && !v.acted && v.x === startX && v.y === startY) return true;
+    if (v?.acted) return false; // committed — B cannot take that back
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+    await sleep(140);
+  }
+  const v = await readUnit(m, A.playerArray, slot);
+  return !!v && !v.selected && !v.acted && v.x === startX && v.y === startY;
+}
+
+/**
+ * Wait for an action to commit, pressing A to clear anything blocking it.
+ *
+ * A LEVEL-UP screen blocks the spent flag: after a heal that levelled Lucius,
+ * +0x0C stayed 0x01 and the staff uses stayed unchanged across consecutive reads
+ * until three A presses dismissed the level-up, at which point everything landed
+ * at once. A single post-action read is not enough for any action granting exp.
+ */
+async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const v = await readUnit(m, A.playerArray, slot);
+    if (v?.acted) return true;
+    if (Date.now() >= deadline) return false;
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 14 }]);
+    await sleep(420);
+  }
+}
+
 // ── Tool implementations ───────────────────────────────────────────────────
 
 async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
@@ -466,41 +806,56 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
 
 interface ActResult { text: string }
 
-async function fe7Act(
+/**
+ * The shared opening every unit action needs: verify it is legal to act, select
+ * the unit, validate the destination against the game's own cost map, walk there
+ * and confirm the walk landed.
+ *
+ * Extracted so staff / item / forecast all inherit the same checks — and, more
+ * importantly, the same DIAGNOSTIC messages. A failure here names which of the
+ * three distinguishable causes fired instead of reporting a generic no-op.
+ */
+type PrologueResult =
+  | { ok: false; text: string }
+  | {
+      ok: true;
+      u: Unit; players: Unit[]; enemies: Unit[]; greens: Unit[];
+      cost: number; startX: number; startY: number;
+    };
+
+async function prologue(
   m: MgbaClient,
   slot: number,
   destX: number,
   destY: number,
-  action: string,
-  targetCycle: number,
-): Promise<ActResult> {
+): Promise<PrologueResult> {
   const phaseB = await readRange(m, A.phase, 1);
   if (phaseB[0] !== 0x00) {
-    return { text: `Refusing to act: phase byte is 0x${hex2(phaseB[0])} (${PHASE_NAME[phaseB[0]] ?? "?"}), not the player phase. Input would be swallowed.` };
+    return { ok: false, text: `Refusing to act: phase byte is 0x${hex2(phaseB[0])} (${PHASE_NAME[phaseB[0]] ?? "?"}), not the player phase. Input would be swallowed.` };
   }
 
   const players = await readArray(m, A.playerArray);
   const enemies = await readArray(m, A.enemyArray);
   const greens = await readArray(m, A.greenArray);
   const u = bySlot(players, slot);
-  if (!u) return { text: `No player unit in slot ${slot}.` };
-  if (!u.deployed) return { text: `Unit #${slot} is benched.` };
-  if (u.dead) return { text: `Unit #${slot} is dead.` };
-  if (u.acted) return { text: `Unit #${slot} has already acted this phase (+0x0C = 0x42).` };
+  if (!u) return { ok: false, text: `No player unit in slot ${slot}.` };
+  if (!u.deployed) return { ok: false, text: `Unit #${slot} is benched.` };
+  if (u.dead) return { ok: false, text: `Unit #${slot} is dead.` };
+  if (u.acted) return { ok: false, text: `Unit #${slot} has already acted this phase (+0x0C = 0x42).` };
 
   const startX = u.x, startY = u.y;
 
   // 1. Cursor onto the unit, then select.
   if (!u.selected) {
     if (!(await moveCursorTo(m, startX, startY))) {
-      return { text: `Could not drive the cursor onto unit #${slot} at (${startX},${startY}). Input appears blocked (event/animation).` };
+      return { ok: false, text: `Could not drive the cursor onto unit #${slot} at (${startX},${startY}). Input appears blocked (event/animation).` };
     }
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 20 }]);
     const okSel = await waitUntil(async () => {
       const v = await readUnit(m, A.playerArray, slot);
       return !!v && v.selected;
     }, 1500);
-    if (!okSel) return { text: `Selection failed: pressed A on (${startX},${startY}) but +0x0C bit 0 never set.` };
+    if (!okSel) return { ok: false, text: `Selection failed: pressed A on (${startX},${startY}) but +0x0C bit 0 never set.` };
   }
 
   // 2. Validate the destination against the game's own cost map BEFORE pressing.
@@ -509,7 +864,7 @@ async function fe7Act(
   const cost = gridCost(grid, destX, destY);
   if (cost === UNREACHABLE) {
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
-    return { text: `Destination (${destX},${destY}) is NOT reachable for unit #${slot} (grid = 0xFF: out of range, or blocked terrain). Move cancelled; unit still at (${startX},${startY}) and unspent.` };
+    return { ok: false, text: `Destination (${destX},${destY}) is NOT reachable for unit #${slot} (grid = 0xFF: out of range, or blocked terrain). Move cancelled; unit still at (${startX},${startY}) and unspent.` };
   }
   // Occupancy must cover ALL THREE factions. Green NPCs were the cause of a
   // whole class of "legal but refused" failures before they were included here:
@@ -521,13 +876,13 @@ async function fe7Act(
   ).get(`${destX},${destY}`);
   if (occ) {
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
-    return { text: `Destination (${destX},${destY}) has cost ${cost} but is OCCUPIED by a ${occ.mark} unit (slot #${occ.u.slot}, cls${hex2(occ.u.classId)}, HP ${occ.u.hp}/${occ.u.maxHp}). The cost map allows routing through units but not stopping on them. Move cancelled.` };
+    return { ok: false, text: `Destination (${destX},${destY}) has cost ${cost} but is OCCUPIED by a ${occ.mark} unit (slot #${occ.u.slot}, cls${hex2(occ.u.classId)}, HP ${occ.u.hp}/${occ.u.maxHp}). The cost map allows routing through units but not stopping on them. Move cancelled.` };
   }
 
   // 3. Drive to the destination and confirm.
   if (!(await moveCursorTo(m, destX, destY))) {
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
-    return { text: `Could not drive the cursor to (${destX},${destY}) while unit #${slot} was selected. Move cancelled.` };
+    return { ok: false, text: `Could not drive the cursor to (${destX},${destY}) while unit #${slot} was selected. Move cancelled.` };
   }
   await press(m, [{ buttons: ["A"], frames: 4, release_frames: 10 }]);
 
@@ -544,6 +899,7 @@ async function fe7Act(
     const v = await readUnit(m, A.playerArray, slot);
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
     return {
+      ok: false,
       text:
         `Pressed A at (${destX},${destY}) (cost ${cost}, no unit found there in any of the three arrays) ` +
         `but unit #${slot} is still at (${v?.x},${v?.y}). The game REFUSED the destination for a reason not ` +
@@ -555,6 +911,30 @@ async function fe7Act(
 
   // Let the walk animation and menu slide finish before touching the menu.
   await sleep(260);
+
+  const fresh = await readUnit(m, A.playerArray, slot);
+  return {
+    ok: true,
+    u: fresh ?? u, players, enemies, greens,
+    cost, startX, startY,
+  };
+}
+
+async function fe7Act(
+  m: MgbaClient,
+  slot: number,
+  destX: number,
+  destY: number,
+  action: string,
+  targetCycle: number,
+  targetSlot: number | null,
+  itemSlot: number | null,
+  targetFaction: string,
+): Promise<ActResult> {
+  const pro = await prologue(m, slot, destX, destY);
+  if (!pro.ok) return { text: pro.text };
+  const { u, players, enemies, greens, cost, startX, startY } = pro;
+
 
   if (action === "wait") {
     const committed = await commitWait(m, A.playerArray, slot);
@@ -581,11 +961,40 @@ async function fe7Act(
     // would overshoot on a 2-step flow and the surplus A opens the field menu
     // (observed — it left Suspend one keypress away). So advance one step at a
     // time and stop the moment the unit reports spent.
+    let picked = false;
+    let forecast = "";
     for (let step = 0; step < 4; step++) {
       await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
-      // Cycle targets once, after Attack and any weapon list are past.
-      if (step === 1 && targetCycle > 0) {
-        await press(m, Array.from({ length: targetCycle }, () => ({ buttons: ["Right"], frames: 4, release_frames: 12 })));
+
+      // The forecast pair is populated exactly when target select is up, so it
+      // tells us we have arrived without counting menu steps. Target choice used
+      // to be blind Right presses verified only from the HP deltas afterwards —
+      // which meant a wrong pick was discovered by killing the wrong unit.
+      if (!picked && (await forecastLive(m))) {
+        picked = true;
+        if (targetSlot !== null) {
+          const want = bySlot(enemies, targetSlot);
+          if (!want) {
+            await unwind(m, slot, startX, startY);
+            return { text: `No enemy in slot ${targetSlot}. Unit #${slot} left unspent at (${startX},${startY}).` };
+          }
+          const landed = await cycleToEnemyTile(m, want.x, want.y);
+          if (!landed || !landed.ok) {
+            await unwind(m, slot, startX, startY);
+            return {
+              text:
+                `Could not aim at enemy #${targetSlot} at (${want.x},${want.y}) from (${destX},${destY}) — the forecast ` +
+                `settled on (${landed?.landedX},${landed?.landedY}). It is probably out of this weapon's range. ` +
+                `Nothing was committed; unit #${slot} is unwound to (${startX},${startY}) and unspent.`,
+            };
+          }
+        } else if (targetCycle > 0) {
+          await press(m, Array.from({ length: targetCycle }, () => ({ buttons: ["Right"], frames: 4, release_frames: 12 })));
+        }
+        const f = await readForecast(m);
+        forecast =
+          `\n  forecast  ${formatSide("attacker", f.actor, f.target.def)}` +
+          `\n            ${formatSide("defender", f.target, f.actor.def)}`;
       }
       // Stop pressing as soon as EITHER the unit is spent OR combat has visibly
       // started (any adjacent enemy's HP moved, or it died and left a hole).
@@ -629,12 +1038,501 @@ async function fe7Act(
       .join(", ");
     return {
       text: done
-        ? `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp}, +0x0C=0x${hex2((self?.flags ?? 0) & 0xff)}.`
+        ? `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp}, +0x0C=0x${hex2((self?.flags ?? 0) & 0xff)}.${forecast}`
         : `Unit #${slot} moved to (${destX},${destY}) and Attack was chosen, but the unit never became spent within 20s. Enemy HP: ${deltas}. Something is still on screen.`,
     };
   }
 
-  return { text: `Unknown action "${action}". Use "wait" or "attack".` };
+  // ── Staff and Item ───────────────────────────────────────────────────────
+  //
+  // Both need the action menu's entry index, and the index is NOT derivable:
+  // FE7 omits entries that don't apply, so the count shifts with adjacency and
+  // terrain, and one observed 5-entry menu still has an unidentified extra
+  // entry. So we TRY a candidate and verify by effect before going deeper.
+  //
+  // That is safe because of a structural fact: from the action menu, the first
+  // A can only open a list or a target selection, and the second A can only
+  // open a target selection or a sub-menu. Neither commits. Only the THIRD A
+  // commits — so every path below confirms what it is looking at before ever
+  // pressing a third time.
+  //
+  // The two exceptions are Rescue and Trade, which jump straight to a target
+  // selection where the SECOND A would commit. Both announce themselves in the
+  // ASCII buffer ("unit to rescue." / "unit to trade with."), so they are
+  // detected and unwound after the first press.
+
+  if (action === "staff" || action === "item") {
+    const label = action === "staff" ? "Staff" : "Item";
+
+    if (action === "staff" && targetSlot === null) {
+      await unwind(m, slot, startX, startY);
+      return { text: `action="staff" needs target_slot (who to heal). Unit #${slot} left unspent at (${startX},${startY}).` };
+    }
+    const staves = action === "staff" ? await staffSlots(m, u) : [];
+    if (action === "staff" && staves.length === 0) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Unit #${slot} carries no staff (inventory: ${u.items.map((i) => hex2(i.id)).join(",") || "empty"}). Left unspent at (${startX},${startY}).` };
+    }
+    // Carrying a staff is not the same as being able to swing it. Rank 0 in the
+    // weapon-rank block means the class cannot use that type at all, so the game
+    // omits Staff from the menu entirely — observed on a unit hauling a Heal staff
+    // it could not use. Check the rank first; otherwise we would drive the whole
+    // menu scan looking for an entry that was never going to be there.
+    if (action === "staff" && u.ranks[WTYPE_STAFF] === 0) {
+      await unwind(m, slot, startX, startY);
+      return {
+        text:
+          `Unit #${slot} carries a staff (${staves.map((i) => hex2(u.items[i].id)).join(",")}) but has STAFF RANK 0 — ` +
+          `its class cannot use staves, so the game offers no Staff entry. It is only carrying it. Left unspent at (${startX},${startY}).`,
+      };
+    }
+    if (action === "item" && u.items.length === 0) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Unit #${slot} carries no items. Left unspent at (${startX},${startY}).` };
+    }
+
+    // Which entry of the sub-list we want: for a staff, the staff list holds only
+    // type-4 items in inventory order, so an inventory slot has to be mapped into
+    // that shorter list. For an item, list index == inventory slot exactly.
+    const wantInvSlot = itemSlot ?? (action === "staff" ? staves[0] : 0);
+    const listIndex = action === "staff" ? Math.max(0, staves.indexOf(wantInvSlot)) : wantInvSlot;
+    if (action === "item" && wantInvSlot >= u.items.length) {
+      await unwind(m, slot, startX, startY);
+      return { text: `item_slot ${wantInvSlot} is out of range — unit #${slot} carries ${u.items.length} item(s). Left unspent.` };
+    }
+
+    const menu = await locateMenu(m);
+    if (!menu) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Unit #${slot} moved to (${destX},${destY}) but the action menu could not be located by diff. Left unspent — retry, or use action="wait".` };
+    }
+
+    // DERIVE the entry index; do not scan for it. Scanning meant pressing A on
+    // entries that could not be identified in advance, and a bad guess is
+    // expensive: one run committed Wait and cost a unit its turn, another left two
+    // units sharing a tile. The order is fixed — Attack, Staff, Rescue, Item,
+    // Trade, ..., Wait — and the one entry we cannot predict (Rescue, which needs
+    // Con and Aid that the live struct does not expose) never moves either target:
+    //   Staff is 0, or 1 when Attack is present. Rescue sits BELOW it.
+    //   Item is counted from the BOTTOM — Wait last, Trade above it when present.
+    //   Rescue sits ABOVE Item.
+    let hasAttack = false;
+    for (const it of u.items) {
+      const t = await itemType(m, it.id);
+      if (t === WTYPE_STAFF || t === 9 || u.ranks[t] === 0) continue;
+      const rng = await itemRange(m, it.id);
+      if (enemies.some((e) => {
+        if (e.dead) return false;
+        const d = Math.abs(e.x - destX) + Math.abs(e.y - destY);
+        return d >= rng.min && d <= rng.max;
+      })) { hasAttack = true; break; }
+    }
+    const hasTrade = players.some(
+      (o) => o.slot !== slot && o.deployed && !o.dead &&
+             Math.abs(o.x - destX) + Math.abs(o.y - destY) === 1,
+    );
+
+    const wantIndex = action === "staff"
+      ? (hasAttack ? 1 : 0)
+      : menu.count - 2 - (hasTrade ? 1 : 0);
+
+    const shape = `menu count ${menu.count}, attack ${hasAttack ? "yes" : "no"}, trade ${hasTrade ? "yes" : "no"} -> index ${wantIndex}`;
+    if (wantIndex < 0 || wantIndex > menu.count - 2) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Could not place ${label} in unit #${slot}'s action menu (${shape}). Refusing to guess — the last entry is Wait and pressing it would spend the turn. Unit unwound to (${startX},${startY}), unspent.` };
+    }
+    if (!(await menuGoTo(m, menu.addr, wantIndex, menu.count))) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Could not move unit #${slot}'s action-menu highlight to index ${wantIndex} (${shape}). Nothing pressed; unit unwound and unspent.` };
+    }
+
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
+    await sleep(200);
+
+    // Rescue and Trade jump straight to a target selection where the NEXT A
+    // commits. If the derivation was wrong and we landed on one, stop here.
+    const opened = await readText(m);
+    if (/unit to rescue|unit to trade/i.test(opened)) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Index ${wantIndex} opened ${opened.includes("rescue") ? "Rescue" : "Trade"}, not ${label} (${shape}). Backed out before anything committed; unit #${slot} unspent at (${startX},${startY}).` };
+    }
+
+    // A one-entry sub-list (a single staff) cannot be located by diff — Down moves
+    // nothing, so there is no delta. Only look when we need a later entry.
+    const list = listIndex === 0 ? null : await locateMenu(m);
+    if (listIndex > 0 && !list) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Opened ${label}'s list but could not locate it to reach entry ${listIndex}. Backed out; unit #${slot} unspent.` };
+    }
+    if (list && !(await menuGoTo(m, list.addr, listIndex, list.count))) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Could not move ${label}'s list highlight to entry ${listIndex}. Backed out; unit #${slot} unspent.` };
+    }
+
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    await sleep(240);
+
+    if (action === "item") {
+      // DECISIVE GUARD. If this was really the weapon list we are now in attack
+      // target select, where the next A commits an attack. The forecast pair is
+      // populated exactly there and nowhere else.
+      if (await forecastLive(m)) {
+        await unwind(m, slot, startX, startY);
+        return { text: `Index ${wantIndex} turned out to be Attack, not Item (${shape}) — the forecast went live. Backed out before committing; unit #${slot} unspent at (${startX},${startY}).` };
+      }
+      const sub = await locateMenu(m);
+      if (!sub || !(await menuGoTo(m, sub.addr, 0, sub.count))) {
+        await unwind(m, slot, startX, startY);
+        return { text: `Reached an item sub-menu but could not put the highlight on Use. Backed out; unit #${slot} unspent. (Discard is the LAST entry — never guessed at.)` };
+      }
+
+      const beforeHp = (await readUnit(m, A.playerArray, slot))?.hp ?? u.hp;
+      await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+      const committed = await awaitCommit(m, slot, 12000);
+      const after = await readUnit(m, A.playerArray, slot);
+      const note = await readText(m);
+      if (!committed) {
+        // A full-HP unit produces IDENTICAL menu shapes and simply refuses. The
+        // menus never tell you an item is unusable — only the effect does.
+        await unwind(m, slot, startX, startY);
+        return {
+          text:
+            `Unit #${slot} selected item ${hex2(u.items[wantInvSlot].id)} but nothing committed. HP ${beforeHp} -> ${after?.hp}. ` +
+            `Text buffer: ${JSON.stringify(note)}. ` +
+            (/no need/i.test(note) ? `The game REFUSED it (already at full HP). ` : ``) +
+            `Unit left unspent at (${after?.x},${after?.y}).`,
+        };
+      }
+      return {
+        text:
+          `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, used item ${hex2(u.items[wantInvSlot].id)} ` +
+          `(inv slot ${wantInvSlot}). HP ${beforeHp} -> ${after?.hp}/${after?.maxHp}. +0x0C=0x${hex2((after?.flags ?? 0) & 0xff)}.`,
+      };
+    }
+
+    // ── staff ──
+    // The staff proc signature is present in exactly one place during staff target
+    // select and nowhere else, so finding it PROVES the state rather than guessing.
+    const ptr = await findTargetPointerAddr(m);
+    const ref0 = ptr ? await readTargetRef(m, ptr) : null;
+    if (!ptr || !ref0) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Index ${wantIndex} did not lead to staff target select (${shape}) — the staff proc signature was not found. Backed out; unit #${slot} unspent at (${startX},${startY}).` };
+    }
+
+    const wantArray = targetFaction === "green" ? A.greenArray : A.playerArray;
+    const tgtBefore = await readUnit(m, wantArray, targetSlot as number);
+    if (!tgtBefore) {
+      await unwind(m, slot, startX, startY);
+      return { text: `No ${targetFaction} unit in slot ${targetSlot} to heal. Unit #${slot} left unspent.` };
+    }
+    if (!(await cycleToTarget(m, ptr, wantArray, targetSlot as number))) {
+      const cur = await readTargetRef(m, ptr);
+      await unwind(m, slot, startX, startY);
+      return {
+        text:
+          `Could not cycle the staff target onto ${targetFaction} #${targetSlot} at (${tgtBefore.x},${tgtBefore.y}) — ` +
+          `it settled on ${cur ? `slot #${cur.slot}` : "nothing readable"}. Most likely out of range from (${destX},${destY}). ` +
+          `Unit #${slot} left unspent.`,
+      };
+    }
+
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    const committed = await awaitCommit(m, slot, 25000);
+    const tgtAfter = await readUnit(m, wantArray, targetSlot as number);
+    const self = await readUnit(m, A.playerArray, slot);
+    const staffId = u.items[wantInvSlot]?.id ?? 0;
+    if (!committed) {
+      return { text: `Unit #${slot} selected ${targetFaction} #${targetSlot} for staff ${hex2(staffId)} but never became spent. Target HP ${tgtBefore.hp} -> ${tgtAfter?.hp}. Something is still on screen.` };
+    }
+    return {
+      text:
+        `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, used staff ${hex2(staffId)} on ` +
+        `${targetFaction} #${targetSlot} — HP ${tgtBefore.hp} -> ${tgtAfter?.hp}/${tgtAfter?.maxHp} ` +
+        `(+${(tgtAfter?.hp ?? 0) - tgtBefore.hp}). +0x0C=0x${hex2((self?.flags ?? 0) & 0xff)}.`,
+    };
+  }
+
+  return { text: `Unknown action "${action}". Use "wait", "attack", "staff" or "item".` };
+}
+
+/**
+ * Read the combat forecast for a hypothetical attack, then put everything back.
+ *
+ * NOT a pure read, despite the name. The forecast pair is stale garbage until
+ * target select is actually on screen, so this has to select the unit, walk it,
+ * open Attack, read, and then unwind — which also returns the unit to its origin
+ * tile. It ends with the unit exactly as it started: unmoved, unselected, unspent.
+ *
+ * Everything reported comes out of the game's own BattleUnit structs. Do not be
+ * tempted to recompute any of it from base stats: support bonuses are already
+ * folded in (a control run measured +1 Def / +5 Avo / +2 Crit / +5 Ddg on a unit
+ * standing near allies, which vanished when the allies were moved away), as are
+ * terrain and the weapon triangle.
+ */
+async function fe7Forecast(
+  m: MgbaClient,
+  slot: number,
+  destX: number,
+  destY: number,
+  targetSlot: number | null,
+): Promise<string> {
+  const pro = await prologue(m, slot, destX, destY);
+  if (!pro.ok) return pro.text;
+  const { u, enemies, startX, startY } = pro;
+
+  const menu = await locateMenu(m);
+  if (!menu) {
+    await unwind(m, slot, startX, startY);
+    return `Unit #${slot} reached (${destX},${destY}) but the action menu could not be located. Nothing changed.`;
+  }
+
+  const tried: string[] = [];
+  for (let cand = 0; cand < menu.count - 1; cand++) {
+    if (!(await menuGoTo(m, menu.addr, cand, menu.count))) continue;
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
+    await sleep(180);
+
+    const txt = await readText(m);
+    if (/unit to rescue|unit to trade/i.test(txt)) {
+      tried.push(`${cand}=${txt.includes("rescue") ? "Rescue" : "Trade"}`);
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+      await sleep(140);
+      continue;
+    }
+
+    // Attack opens a weapon list; one more A reaches target select. Both presses
+    // are safe — only a third commits.
+    let live = await forecastLive(m);
+    if (!live) {
+      await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+      await sleep(220);
+      live = await forecastLive(m);
+    }
+    if (!live) {
+      tried.push(`${cand}=no-forecast`);
+      await press(m, [
+        { buttons: ["B"], frames: 4, release_frames: 22 },
+        { buttons: ["B"], frames: 4, release_frames: 22 },
+      ]);
+      await sleep(160);
+      continue;
+    }
+
+    if (targetSlot !== null) {
+      const want = bySlot(enemies, targetSlot);
+      if (!want) {
+        await unwind(m, slot, startX, startY);
+        return `No enemy in slot ${targetSlot}. Nothing changed.`;
+      }
+      const landed = await cycleToEnemyTile(m, want.x, want.y);
+      if (!landed || !landed.ok) {
+        await unwind(m, slot, startX, startY);
+        return (
+          `Could not aim at enemy #${targetSlot} at (${want.x},${want.y}) from (${destX},${destY}) — the forecast ` +
+          `settled on (${landed?.landedX},${landed?.landedY}). Probably out of range. Nothing changed.`
+        );
+      }
+    }
+
+    const f = await readForecast(m);
+    const t = await battleTargetTile(m);
+    const foe = t ? enemies.find((e) => e.x === t.x && e.y === t.y) ?? null : null;
+
+    const restored = await unwind(m, slot, startX, startY);
+    const lines = [
+      `Forecast — unit #${slot} cls${hex2(u.classId)} attacking from (${destX},${destY})` +
+        (foe ? ` vs enemy #${foe.slot} cls${hex2(foe.classId)} at (${foe.x},${foe.y}) HP ${foe.hp}/${foe.maxHp}`
+             : t ? ` vs the unit on (${t.x},${t.y}) (not matched to an enemy slot)` : ""),
+      `  ${formatSide("attacker", f.actor, f.target.def)}`,
+      `  ${formatSide("defender", f.target, f.actor.def)}`,
+      `  projected HP after: attacker ${f.actor.projHp}, defender ${f.target.projHp}` +
+        `  <- a deterministic every-blow-lands projection, NOT a prediction; real combat rolls hit and crit`,
+      restored
+        ? `  (unit returned to (${startX},${startY}), unselected and unspent — nothing was committed)`
+        : `  WARNING: could not fully unwind. Check fe7_state before acting.`,
+    ];
+    return lines.join("\n");
+  }
+
+  await unwind(m, slot, startX, startY);
+  return (
+    `Unit #${slot} moved to (${destX},${destY}) but no menu entry led to a forecast ` +
+    `(menu count ${menu.count}; tried ${tried.join(", ") || "nothing"}). Most likely nothing is in range. Nothing changed.`
+  );
+}
+
+/**
+ * Move one item between two adjacent units.
+ *
+ * Trade does NOT consume the action — after backing out, +0x0C is still 0x01 and
+ * the action menu reopens — so this is free to do before deciding what a unit
+ * actually does. That is the whole reason it is its own tool rather than an
+ * action on fe7_act, whose contract is "commit this unit's turn".
+ *
+ * LIMITATION: the two units must ALREADY be adjacent; pass the acting unit's
+ * current tile. Trading after a move is not supported, because whether cancelling
+ * the move also reverts an already-written trade has not been tested, and
+ * guessing wrong would silently corrupt inventories.
+ */
+async function fe7Trade(
+  m: MgbaClient,
+  slot: number,
+  partnerSlot: number,
+  giveItemSlot: number,
+): Promise<string> {
+  const players = await readArray(m, A.playerArray);
+  const me = bySlot(players, slot);
+  const partner = bySlot(players, partnerSlot);
+  if (!me) return `No player unit in slot ${slot}.`;
+  if (!partner) return `No player unit in slot ${partnerSlot}.`;
+  if (me.acted) return `Unit #${slot} has already acted.`;
+  const dist = Math.abs(me.x - partner.x) + Math.abs(me.y - partner.y);
+  if (dist !== 1) {
+    return (
+      `Units #${slot} (${me.x},${me.y}) and #${partnerSlot} (${partner.x},${partner.y}) are ${dist} tiles apart; ` +
+      `trade needs them adjacent. Move one with fe7_act first — this tool deliberately does not move units.`
+    );
+  }
+  if (giveItemSlot >= me.items.length) {
+    return `item_slot ${giveItemSlot} is out of range — unit #${slot} carries ${me.items.length} item(s).`;
+  }
+  if (partner.items.length >= 5) {
+    return `Unit #${partnerSlot} already carries 5 items; there is no free slot to receive one.`;
+  }
+
+  const invBefore = async (u: Unit) => (await readRange(m, u.addr + 0x1e, 10)).map(hex2).join(" ");
+  const meBefore = await invBefore(me);
+  const partnerBefore = await invBefore(partner);
+
+  const pro = await prologue(m, slot, me.x, me.y);
+  if (!pro.ok) return pro.text;
+  const { startX, startY } = pro;
+
+  const menu = await locateMenu(m);
+  if (!menu) {
+    await unwind(m, slot, startX, startY);
+    return `Could not locate unit #${slot}'s action menu. Nothing changed.`;
+  }
+
+  for (let cand = menu.count - 2; cand >= 0; cand--) {
+    // Trade sits immediately above Wait when present, so scan upward from the
+    // bottom — everything whose presence we cannot predict (Attack, Staff,
+    // Rescue) sits ABOVE Trade in the fixed order.
+    if (!(await menuGoTo(m, menu.addr, cand, menu.count))) continue;
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
+    await sleep(200);
+
+    // The "…unit to trade with." prompt is TRANSIENT — by the time we read the
+    // buffer it has often been overwritten (observed: an item description, then a
+    // weapon name). So identify Trade structurally instead: it is the only entry
+    // at count-2 that opens a unit-target selection rather than a list.
+    const asc = await readText(m);
+    if (/unit to rescue/i.test(asc)) {
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+      await sleep(140);
+      continue;
+    }
+    // In a unit-target selection the MAP CURSOR jumps onto the highlighted unit;
+    // a menu never moves it. That is a cheap, reliable discriminator — and unlike
+    // locateMenu it has no side effects, which matters because locateMenu's own
+    // Down press moves the partner highlight and then finds a false "menu".
+    const cur = await readCursor(m);
+    const onAlly = players.some(
+      (o) => o.slot !== slot && o.deployed && !o.dead && o.x === cur.x && o.y === cur.y,
+    );
+    if (!onAlly) {
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+      await sleep(140);
+      continue;
+    }
+
+    const ptr = await findTargetPointerAddr(m);
+    if (!ptr || !(await cycleToTarget(m, ptr, A.playerArray, partnerSlot))) {
+      await unwind(m, slot, startX, startY);
+      return `Reached trade partner select but could not put the highlight on #${partnerSlot}. Nothing changed.`;
+    }
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    await sleep(300);
+
+    // The trade screen's two cursor fields live in a dynamically allocated
+    // struct, so find them by what moves. Do NOT reuse a remembered offset: the
+    // trade proc's +0x28 holds the INITIAL partner and then goes stale, which
+    // already fooled one investigation.
+    const findByPress = async (btn: string, back: string): Promise<number | null> => {
+      await m.call("snapshot_memory", { name: "fe7_trade", address: A.uiArena, length: UI_ARENA_LEN });
+      await press(m, [{ buttons: [btn], frames: 4, release_frames: 18 }]);
+      let hit: number | null = null;
+      for (let a = 0; a < 3 && hit === null; a++) {
+        await sleep(a === 0 ? 90 : 160);
+        const d = await m.call<{ changes: unknown }>("diff_memory", {
+          name: "fe7_trade", predicate: "changed", width: 1, max_results: 256,
+        });
+        const ch = asArray<{ address: number; before: number; after: number }>(d.changes);
+        if (ch.length > 0 && ch.length < 30) {
+          const c = ch.find((x) => x.before < 8 && x.after < 8 && x.before !== x.after);
+          if (c) hit = c.address;
+        }
+      }
+      await press(m, [{ buttons: [back], frames: 4, release_frames: 18 }]);
+      return hit;
+    };
+
+    const rowAddr = await findByPress("Down", "Up");
+    const colAddr = await findByPress("Right", "Left");
+    if (rowAddr === null || colAddr === null) {
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 24 }]);
+      await unwind(m, slot, startX, startY);
+      return `Opened the trade screen but could not locate its row/column cursor bytes by diff. Backed out; nothing changed.`;
+    }
+
+    // Column 0 is the acting unit's list.
+    for (let g = 0; g < 4; g++) {
+      if ((await readRange(m, colAddr, 1))[0] === 0) break;
+      await press(m, [{ buttons: ["Left"], frames: 4, release_frames: 18 }]);
+      await sleep(70);
+    }
+    for (let g = 0; g < 8; g++) {
+      if ((await readRange(m, rowAddr, 1))[0] === giveItemSlot) break;
+      await press(m, [{ buttons: ["Down"], frames: 4, release_frames: 18 }]);
+      await sleep(70);
+    }
+    if ((await readRange(m, rowAddr, 1))[0] !== giveItemSlot) {
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 24 }]);
+      await unwind(m, slot, startX, startY);
+      return `Could not move the trade cursor onto inventory slot ${giveItemSlot}. Backed out; nothing changed.`;
+    }
+
+    // A on one of our items auto-jumps to the partner's column at its first
+    // empty slot; a second A completes the transfer.
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 22 }]);
+    await sleep(200);
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 22 }]);
+    await sleep(260);
+
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 26 }]);
+    await sleep(220);
+
+    const meNow = await readUnit(m, A.playerArray, slot);
+    const partnerNow = await readUnit(m, A.playerArray, partnerSlot);
+    const meAfter = await invBefore(me);
+    const partnerAfter = await invBefore(partner);
+    const changed = meAfter !== meBefore || partnerAfter !== partnerBefore;
+
+    await unwind(m, slot, startX, startY);
+    const spent = meNow?.acted ? " WARNING: the unit is now marked spent, which trade should not do." : "";
+    return (
+      `Trade #${slot} -> #${partnerSlot}, giving inventory slot ${giveItemSlot}.\n` +
+      `  #${slot}        ${meBefore}\n  ->            ${meAfter}\n` +
+      `  #${partnerSlot}        ${partnerBefore}\n  ->            ${partnerAfter}\n` +
+      (changed
+        ? `Inventories changed as expected. Unit #${slot} is still unspent, so it can still act this turn.${spent}`
+        : `NOTHING CHANGED — the trade did not take. Unit #${slot} is unspent; check adjacency and free slots.${spent}`)
+    );
+  }
+
+  await unwind(m, slot, startX, startY);
+  return `No action-menu entry announced itself as Trade (menu count ${menu.count}). Nothing changed.`;
 }
 
 /**
@@ -816,17 +1714,62 @@ export const FE7_TOOLS: Tool[] = [
         y: { type: "number", description: "Destination tile y." },
         action: {
           type: "string",
-          enum: ["wait", "attack"],
-          description: "'wait' ends the unit's turn on the destination tile (selected via the wrap-to-last-entry trick, which is structurally safe). 'attack' picks the Attack entry and confirms against an adjacent enemy; it falls back to Wait if no enemy is adjacent.",
+          enum: ["wait", "attack", "staff", "item"],
+          description:
+            "'wait' ends the unit's turn on the destination tile (selected via the wrap-to-last-entry trick, which is structurally safe). " +
+            "'attack' picks Attack and confirms against a target — pass target_slot to choose which enemy and have the choice VERIFIED before swinging. " +
+            "'staff' heals with a staff: requires target_slot, and item_slot if the unit carries more than one staff. " +
+            "'item' uses an item on the unit itself (a vulnerary); item_slot picks which, defaulting to the first. " +
+            "Only 'wait' can end the turn without an effect — every other action confirms it landed and reports what changed.",
+        },
+        target_slot: {
+          type: "number",
+          description:
+            "Who to act on: the enemy slot for 'attack', the ally slot for 'staff'. The highlighted target is READ BACK from memory and verified before anything is confirmed, so a wrong pick fails loudly instead of hitting the wrong unit. Omit on 'attack' to take the game's default target.",
+        },
+        target_faction: {
+          type: "string",
+          enum: ["player", "green"],
+          description: "Which array target_slot indexes for action='staff'. Defaults to 'player'. Green NPCs are valid staff targets.",
+        },
+        item_slot: {
+          type: "number",
+          description: "Inventory slot (0-based, as listed by fe7_state) of the staff or item to use. Defaults to the first staff for 'staff' and slot 0 for 'item'.",
         },
         target_cycle: {
           type: "number",
-          description: "For action='attack' with several adjacent enemies: how many times to press Right to cycle off the default target. Defaults to 0. The chosen target cannot currently be read back, so verify from the returned HP deltas.",
+          description: "DEPRECATED fallback for action='attack': blind Right presses to cycle targets, used only when target_slot is omitted. Prefer target_slot, which is verified.",
         },
       },
       required: ["slot", "x", "y", "action"],
     },
   },
+  {
+    name: "fe7_forecast",
+    description:
+      "PURPOSE: Read Fire Emblem 7's combat forecast — both sides' damage, number of blows, hit%, crit%, AS and avoid — for an attack you have NOT committed to yet. " +
+      "USAGE: Call this before fe7_act(action='attack') whenever the trade matters: a wounded unit, a possible kill, or a choice between targets. Pass the destination tile you would attack from, so you can compare attacking from different tiles. " +
+      "BEHAVIOR: Drives input, despite being a read. The forecast structs are stale garbage until target select is actually on screen, so this selects the unit, walks it to the destination, opens Attack, reads the game's own BattleUnit structs, then unwinds — leaving the unit back on its original tile, unselected and unspent. Nothing is committed. Every number comes from the game, so support, terrain and weapon-triangle bonuses are already included; never recompute these from base stats. " +
+      "RETURNS: One block with each side's damage x blows, effective hit and crit, AS, avoid and dodge, plus the projected post-battle HP — which is a deterministic every-blow-lands projection, NOT a prediction of the real fight.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slot:        { type: "number", description: "Attacking player slot from fe7_state." },
+        x:           { type: "number", description: "Tile x to attack from. Use the unit's current x to forecast without moving." },
+        y:           { type: "number", description: "Tile y to attack from." },
+        target_slot: { type: "number", description: "Enemy slot to forecast against. Omit to take the game's default target; the unit actually selected is always reported back." },
+      },
+      required: ["slot", "x", "y"],
+    },
+  },
+  // fe7_trade is DELIBERATELY NOT REGISTERED. The implementation below is
+  // complete but does not work yet: identifying the Trade entry fails, and live
+  // testing suggests why — pressing A on Trade appears to open the trade SCREEN
+  // directly rather than a partner selection (the ASCII buffer showed an item
+  // name, and the map cursor never moved onto an ally). RAM.md's write-up assumes
+  // a partner-select step with a readable highlight. Rather than ship a tool that
+  // burns calls and returns nothing, this stays unregistered until the flow is
+  // re-derived. Everything else here is tested and working.
   {
     name: "fe7_end_turn",
     description:
@@ -879,8 +1822,29 @@ export async function handleFe7(
 
     case "fe7_act":
       return wrap(
-        (await fe7Act(m, Number(p.slot), Number(p.x), Number(p.y), String(p.action), Number(p.target_cycle ?? 0))).text,
+        (
+          await fe7Act(
+            m,
+            Number(p.slot), Number(p.x), Number(p.y),
+            String(p.action),
+            Number(p.target_cycle ?? 0),
+            p.target_slot === undefined ? null : Number(p.target_slot),
+            p.item_slot === undefined ? null : Number(p.item_slot),
+            p.target_faction === undefined ? "player" : String(p.target_faction),
+          )
+        ).text,
       );
+
+    case "fe7_forecast":
+      return wrap(
+        await fe7Forecast(
+          m, Number(p.slot), Number(p.x), Number(p.y),
+          p.target_slot === undefined ? null : Number(p.target_slot),
+        ),
+      );
+
+    case "fe7_trade":
+      return wrap(await fe7Trade(m, Number(p.slot), Number(p.partner_slot), Number(p.item_slot)));
 
     case "fe7_end_turn":
       return wrap(await fe7EndTurn(m, Number(p.timeout_ms ?? 12000)));
