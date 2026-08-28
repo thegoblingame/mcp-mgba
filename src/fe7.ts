@@ -23,6 +23,7 @@
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { MgbaClient } from "./mgba.js";
+import { readFile, unlink } from "node:fs/promises";
 
 // ── Addresses (US release, ROM title FIREEMBLEME / AGB-AE7E) ────────────────
 
@@ -437,6 +438,21 @@ function decodeSide(b: number[], o: number): BattleSide {
 async function forecastLive(m: MgbaClient): Promise<boolean> {
   const b = await readRange(m, A.battleTarget + 0x04, 4);
   return u32(b, 0) !== 0;
+}
+
+/**
+ * Zero the forecast gate so that forecastLive() means "the game populated this
+ * JUST NOW" instead of "a forecast happened at some point this session".
+ *
+ * The structs are never cleared by the game, so after the first forecast the raw
+ * gate reads non-zero forever — it reported an attack target selection as open
+ * while the cursor was demonstrably free on the map. Clearing first turns a
+ * stale-prone read into a confirm-by-effect test, which is the only kind worth
+ * making decisions on here: the item path uses it to refuse to press A when it
+ * has accidentally opened Attack.
+ */
+async function clearForecastGate(m: MgbaClient): Promise<void> {
+  await m.call("write_range", { address: A.battleTarget + 0x04, bytes: [0, 0, 0, 0] });
 }
 
 async function readForecast(m: MgbaClient): Promise<{ actor: BattleSide; target: BattleSide }> {
@@ -963,6 +979,7 @@ async function fe7Act(
     // time and stop the moment the unit reports spent.
     let picked = false;
     let forecast = "";
+    await clearForecastGate(m);
     for (let step = 0; step < 4; step++) {
       await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
 
@@ -1169,6 +1186,7 @@ async function fe7Act(
       return { text: `Could not move ${label}'s list highlight to entry ${listIndex}. Backed out; unit #${slot} unspent.` };
     }
 
+    await clearForecastGate(m);
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
     await sleep(240);
 
@@ -1290,6 +1308,7 @@ async function fe7Forecast(
   const tried: string[] = [];
   for (let cand = 0; cand < menu.count - 1; cand++) {
     if (!(await menuGoTo(m, menu.addr, cand, menu.count))) continue;
+    await clearForecastGate(m);
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
     await sleep(180);
 
@@ -1536,6 +1555,134 @@ async function fe7Trade(
 }
 
 /**
+ * Diagnose a stuck game and say what to press.
+ *
+ * WHY THIS EXISTS, AND WHY IT LEADS WITH MEMORY
+ * ---------------------------------------------
+ * "Nothing is happening" has three completely different causes that look
+ * identical from the outside: input is being swallowed by an event or animation,
+ * a menu is open and eating direction presses, or the game is simply on another
+ * phase. Guessing wrong wastes presses and can commit something.
+ *
+ * The input-signature probe separates all three from memory, which is checkable:
+ * press a direction and see what moves. If the live cursor moved, input is being
+ * accepted. If it did not but a menu's index byte and its mirror did, a menu is
+ * open — and the same diff LOCATES it. If nothing meaningful moved at all, input
+ * is going nowhere.
+ *
+ * The screenshot is corroboration, and it is here for the one job memory cannot
+ * do: saying WHAT is on screen — which dialogue, whose portrait, what the
+ * objective text says. It is deliberately not the thing state is inferred from,
+ * because reading state off pixels is how you end up confidently wrong.
+ */
+async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }> {
+  const L: string[] = [];
+
+  const [ps, cur] = await Promise.all([readRange(m, A.phase, 2), readCursor(m)]);
+  const phase = ps[0], turn = ps[1];
+
+  const players = await readArray(m, A.playerArray);
+  const selected = players.find((u) => u.deployed && !u.dead && u.selected) ?? null;
+
+  L.push(`STATE  phase 0x${hex2(phase)} (${PHASE_NAME[phase] ?? "?"}) | turn ${turn} | cursor (${cur.x},${cur.y})`);
+  L.push(`       selected unit: ${selected ? `#${selected.slot} cls${hex2(selected.classId)} at (${selected.x},${selected.y})` : "none"}`);
+
+  const fcLive = await forecastLive(m);
+  const staffHit = await m.call<{ count: number }>("search_memory", {
+    bytes: STAFF_PROC_SIG, region: "EWRAM", align: 4, max_results: 4,
+  });
+  // Reported, not trusted: the game never clears these structs, so a non-zero
+  // gate only means a forecast happened at SOME point. The probe below is the
+  // authority, which is why the verdict checks cursor movement first.
+  L.push(`       forecast pair: ${fcLive ? "populated (may be stale from an earlier forecast — not proof a target selection is open)" : "never populated"}`);
+  L.push(`       staff target proc: ${staffHit.count === 1 ? "PRESENT (a staff target selection is open)" : "absent"}`);
+  L.push(`       text buffer: ${JSON.stringify(await readText(m))}`);
+
+  // ── Input-signature probe ────────────────────────────────────────────────
+  // Press away from the map edge so a blocked cursor is never mistaken for
+  // swallowed input, then press back so the probe restores whatever it moved —
+  // true whether it moved a cursor, a menu index, or nothing at all.
+  const dir = cur.y > 0 ? "Up" : "Down";
+  const back = dir === "Up" ? "Down" : "Up";
+
+  await m.call("snapshot_memory", { name: "fe7_stuck", address: A.uiArena, length: UI_ARENA_LEN });
+  await press(m, [{ buttons: [dir], frames: 4, release_frames: 18 }]);
+  await sleep(140);
+
+  const curAfter = await readCursor(m);
+  let changes: Array<{ address: number; before: number; after: number }> = [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await m.call<{ changes: unknown; count: number }>("diff_memory", {
+      name: "fe7_stuck", predicate: "changed", width: 1, max_results: 256,
+    });
+    changes = asArray<{ address: number; before: number; after: number }>(r.changes);
+    if (changes.length > 0 && changes.length < 40) break;
+    await sleep(160);
+  }
+
+  const cursorMoved = curAfter.x !== cur.x || curAfter.y !== cur.y;
+  const byAddr = new Map(changes.map((c) => [c.address, c]));
+  let menuPair: { addr: number; count: number } | null = null;
+  for (const c of changes) {
+    const mir = byAddr.get(c.address + 1);
+    if (!mir || mir.before !== c.before || mir.after !== c.after) continue;
+    const b = await readRange(m, c.address - 1, 1);
+    if (b[0] >= 2 && b[0] <= 10 && c.after < b[0]) { menuPair = { addr: c.address, count: b[0] }; break; }
+  }
+
+  await press(m, [{ buttons: [back], frames: 4, release_frames: 18 }]);
+
+  let verdict: string;
+  const rec: string[] = [];
+  if (phase !== 0x00) {
+    verdict = "NOT THE PLAYER PHASE";
+    rec.push(`The game is on the ${PHASE_NAME[phase] ?? "unknown"} phase, so map input is ignored by design. Nothing is stuck.`);
+    rec.push(`Call fe7_wait — it polls the phase and presses A about once a second, which also clears death quotes and event text.`);
+  } else if (cursorMoved) {
+    verdict = `FREE CURSOR — input IS being accepted (${dir} moved it to (${curAfter.x},${curAfter.y}))`;
+    rec.push(`The game is taking input normally, so whatever failed was not a dropped press.`);
+    if (selected) rec.push(`Unit #${selected.slot} is still SELECTED mid-move. Press B to deselect it before doing anything else.`);
+    else rec.push(`If a tool reported a refused destination, suspect an occupied tile — check all three arrays, green NPCs included — rather than lost input.`);
+  } else if (staffHit.count === 1) {
+    verdict = "STAFF TARGET SELECT is open";
+    rec.push(`B backs out safely; A would commit the staff use.`);
+  } else if (menuPair) {
+    verdict = `MENU OPEN at 0x${menuPair.addr.toString(16).toUpperCase()} — ${menuPair.count} entries (the ${dir} press moved its index, not the cursor)`;
+    rec.push(`Press B to close it. Do NOT press A to "see what happens": the last entry of a unit action menu is Wait, and in the field menu Suspend sits directly above End.`);
+  } else if (fcLive && changes.length > 0) {
+    // Reached only after the reliable checks have all missed, because a populated
+    // forecast is not by itself proof of anything — the game never clears it.
+    verdict = `POSSIBLY an attack target selection (cursor frozen, no menu index found, forecast populated — but that gate goes stale, so treat this as a guess)`;
+    rec.push(`Confirm with the screenshot before acting. If it IS target select, B backs out and A would COMMIT the attack.`);
+    rec.push(`If the screen shows a dialogue instead, press A to clear it.`);
+  } else {
+    verdict = `INPUT SWALLOWED — ${dir} moved neither the cursor nor any menu index (${changes.length} bytes changed)`;
+    rec.push(`An event, dialogue box, level-up or animation is holding input. Press A repeatedly — that is exactly what dismisses it, and what fe7_wait does on a loop.`);
+    rec.push(`A level-up also blocks a unit's spent flag, so an action can look like it never landed when it is only waiting to be acknowledged.`);
+  }
+
+  L.push("");
+  L.push(`PROBE  pressed ${dir}: cursor ${cursorMoved ? `moved (${cur.x},${cur.y})->(${curAfter.x},${curAfter.y})` : "did not move"}, ${changes.length} bytes changed in the UI arena`);
+  L.push(`VERDICT  ${verdict}`);
+  L.push("");
+  L.push("RECOMMENDATION");
+  for (const r of rec) L.push(`  - ${r}`);
+  L.push("");
+  L.push(`The screenshot below is for reading WHAT is on screen — dialogue text, the objective, whose portrait is up.`);
+  L.push(`Do not read game state off it; the memory verdict above is the checkable answer.`);
+
+  let png: string | undefined;
+  try {
+    const path = await m.call<string>("screenshot", {});
+    png = (await readFile(path)).toString("base64");
+    await unlink(path).catch(() => {});
+  } catch (e) {
+    L.push(`(screenshot unavailable: ${e instanceof Error ? e.message : String(e)})`);
+  }
+  return { text: L.join("\n"), png };
+}
+
+/**
  * Wait for the player phase to return, pressing A periodically while it hasn't.
  *
  * Pressing A is safe here and is the whole trick: during the enemy phase the
@@ -1771,6 +1918,15 @@ export const FE7_TOOLS: Tool[] = [
   // burns calls and returns nothing, this stays unregistered until the flow is
   // re-derived. Everything else here is tested and working.
   {
+    name: "fe7_unstick",
+    description:
+      "PURPOSE: Work out why the game appears frozen and say exactly what to press. Use it the moment a tool reports that nothing happened, a unit will not move, presses seem ignored, or you cannot tell what is on screen. " +
+      "USAGE: Call it first when confused, before trying more presses — guessing costs presses and a wrong A can commit an action. It is safe to call at any time and changes nothing. " +
+      "BEHAVIOR: Reads phase, turn, cursor, whether any unit is selected, whether an attack or staff target selection is open, and the ASCII text buffer. Then runs the input-signature probe: it presses one direction away from the map edge and sees what moved — the live cursor (input is being accepted), a menu's index byte and mirror (a menu is open, and it reports the address and entry count), or nothing (input is being swallowed by an event, dialogue, level-up or animation). It presses the opposite direction afterwards, so the probe restores whatever it moved. " +
+      "RETURNS: The state read, the probe result, a verdict naming which of those three cases holds, a concrete recommendation, AND a screenshot. Read the screenshot for WHAT is displayed — dialogue text, the objective, which portrait is up — not for game state; the memory verdict is the checkable answer.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
     name: "fe7_end_turn",
     description:
       "PURPOSE: End the player phase and block until the player phase comes back, so the enemy phase runs without you polling for it. " +
@@ -1810,7 +1966,7 @@ export async function handleFe7(
   name: string,
   p: Record<string, unknown>,
   m: MgbaClient,
-): Promise<{ content: Array<{ type: "text"; text: string }> } | null> {
+): Promise<{ content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> } | null> {
   const wrap = (text: string) => ({ content: [{ type: "text" as const, text }] });
 
   switch (name) {
@@ -1845,6 +2001,14 @@ export async function handleFe7(
 
     case "fe7_trade":
       return wrap(await fe7Trade(m, Number(p.slot), Number(p.partner_slot), Number(p.item_slot)));
+
+    case "fe7_unstick": {
+      const r = await fe7Unstick(m);
+      const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> =
+        [{ type: "text", text: r.text }];
+      if (r.png) content.push({ type: "image", data: r.png, mimeType: "image/png" });
+      return { content };
+    }
 
     case "fe7_end_turn":
       return wrap(await fe7EndTurn(m, Number(p.timeout_ms ?? 12000)));
