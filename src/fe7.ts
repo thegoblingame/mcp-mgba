@@ -2048,14 +2048,39 @@ async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
   if (!spot) return `Could not find an empty tile near the cursor to open the field menu.`;
   if (!(await moveCursorTo(m, spot.x, spot.y))) return `Could not move the cursor to empty tile (${spot.x},${spot.y}).`;
 
-  // Field menu: 5 entries, End is LAST and indices wrap, so A/Up/A can only
-  // ever reach Unit or End — never Suspend, which sits directly above End.
+  // Field menu: 5 entries, End is LAST and indices wrap, so A/Up/A can only ever
+  // reach Unit or End — never Suspend, which sits directly above End.
+  //
+  // That argument is sound INSIDE the menu and says nothing about whether the
+  // menu is open. If the first A is dropped, or the cursor was not on empty
+  // ground, the Up walks the map cursor and the second A lands on the board.
+  // So verify it the same way commitWait does: a menu swallows the Up and the
+  // cursor holds still; a bare map does not.
   for (let attempt = 0; attempt < 3; attempt++) {
+    const cur0 = await readCursor(m);
     await press(m, [
       { buttons: ["A"], frames: 4, release_frames: 20 },
       { buttons: ["Up"], frames: 4, release_frames: 16 },
-      { buttons: ["A"], frames: 4, release_frames: 20 },
     ]);
+    await sleep(120);
+    const cur1 = await readCursor(m);
+
+    if (cur1.x !== cur0.x || cur1.y !== cur0.y) {
+      // No menu took focus. Restore the cursor and retry the whole sequence
+      // rather than sending the second A at the board.
+      await press(m, [
+        { buttons: ["Down"], frames: 4, release_frames: 16 },
+        { buttons: ["B"], frames: 4, release_frames: 20 },
+      ]);
+      if (attempt === 2) {
+        return `Tried the end-turn sequence 3x but the field menu never took focus — each Up moved the map ` +
+          `cursor instead, so the first A is being dropped or (${spot.x},${spot.y}) is not empty ground. ` +
+          `Cursor restored; no A was sent at the board. Nothing was ended.`;
+      }
+      continue;
+    }
+
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 20 }]);
     const left = await waitUntil(async () => {
       const b = await readRange(m, A.phase, 1);
       return b[0] !== 0x00;
@@ -2107,7 +2132,7 @@ export const FE7_TOOLS: Tool[] = [
     description:
       "PURPOSE: Show exactly where a unit can move, read from the game's own movement cost map, as an ASCII grid annotated with which tiles are actually legal destinations. " +
       "USAGE: Call this BEFORE fe7_act when you are unsure a destination is in range — it answers 'can this unit reach that tile' for every tile at once, already accounting for terrain cost, class and blocking units. " +
-      "BEHAVIOR: Drives input — it moves the cursor onto the unit and presses A to select (which is what populates the grid), then presses B to deselect unless `keep_selected` is set. Every step is verified against memory. " +
+      "BEHAVIOR: Drives input — it moves the cursor onto the unit and presses A to select (which is what populates the grid), then presses B to deselect unless `keep_selected` is set. Every step is verified against memory. The grid's geometry is DERIVED PER CHAPTER from the game's own row-pointer table (row count and stride are sized to the map and differ per chapter — never hardcoded), and the decode is asserted by requiring the cost-0 tile to equal the selected unit's position, so a misread fails loudly instead of returning a plausible wrong map. " +
       "IMPORTANT: the underlying grid is a PATHFINDING COST map and includes tiles occupied by other units — you may route through allies but not stop on them. This tool marks those tiles 'U'/'E' so legal destinations are only the numeric ones. " +
       "RETURNS: A cost grid (digits = move cost and a legal stop, U = ally, E = enemy, . = unreachable), the unit's Move, and a count of legal destinations.",
     inputSchema: {
@@ -2139,7 +2164,7 @@ export const FE7_TOOLS: Tool[] = [
           type: "string",
           enum: ["wait", "attack", "staff", "item"],
           description:
-            "'wait' ends the unit's turn on the destination tile (selected via the wrap-to-last-entry trick, which is structurally safe). " +
+            "'wait' ends the unit's turn on the destination tile, picked by wrapping the action menu UP to its last entry. That Up is MENU navigation, not a map input: it is verified by re-reading the cursor, because with no menu open it walks the map instead and the A behind it lands on the board. Commit is confirmed by the TURN CLOCK, not by the has-acted flag — if this is the last unspent unit its Wait ends the phase and the new turn clears that flag, which is success, not failure. " +
             "'attack' picks Attack and confirms against a target — pass target_slot to choose which enemy and have the choice VERIFIED before swinging. " +
             "'staff' heals with a staff: requires target_slot, and item_slot if the unit carries more than one staff. " +
             "'item' uses an item on the unit itself (a vulnerary); item_slot picks which, defaulting to the first. " +
@@ -2230,7 +2255,7 @@ export const FE7_TOOLS: Tool[] = [
     description:
       "PURPOSE: End the player phase and block until the player phase comes back, so the enemy phase runs without you polling for it. " +
       "USAGE: Call once every unit you care about has acted. Saves the repeated read-and-wait loop that ending a turn otherwise requires, and guarantees the next action you take is not silently swallowed by an in-progress enemy phase. " +
-      "BEHAVIOR: Drives input. Finds an empty tile near the cursor (the field menu only opens on empty ground — on a unit, A selects it instead), then uses the A/Up/A sequence, which is safe by structure: the field menu wraps and End is last, so a single Up from the top entry can only reach Unit or End, never Suspend. Retries if the phase byte does not change, then waits for the enemy and green phases to finish. " +
+      "BEHAVIOR: Drives input. Finds an empty tile near the cursor (the field menu only opens on empty ground — on a unit, A selects it instead), then uses the A/Up/A sequence. Inside the menu that is safe by structure: it wraps and End is last, so a single Up from the top entry reaches Unit or End, never Suspend. That argument only holds once the menu HAS focus, so the Up is verified by re-reading the cursor — if the cursor moved, the first A was dropped, and the sequence is restored and retried rather than pressed at the board. Retries if the phase byte does not change, then waits for the enemy and green phases to finish. " +
       "RETURNS: The turn counter, whether the player phase is already back, and a battlefield summary listing any units that fell. If the enemy phase is still running it says so and tells you to call fe7_wait — that is the normal outcome on a large map, not an error.",
     inputSchema: {
       type: "object",
