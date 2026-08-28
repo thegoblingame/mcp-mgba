@@ -6,6 +6,10 @@ bridge, plus `src/fe7.ts` — the Fire Emblem 7 tool layer we wrote on top of it
 **This repo is the machinery. The game knowledge lives in `~/Desktop/repos/llm_plays_fe7`.**
 Do not duplicate facts from there into here; they go stale in one place and not the other.
 
+**Never read `llm_plays_fe7/misc/`.** It is Grant's scratch space — notes he may want to
+copy-paste later, deliberately not for you. That rule lives in the other repo's `CLAUDE.md`,
+which does not load when a session starts here, so it is restated where it will be seen.
+
 ## Where to look things up
 
 | If you are… | Read |
@@ -15,6 +19,15 @@ Do not duplicate facts from there into here; they go stale in one place and not 
 | Deciding what to work on | `llm_plays_fe7/BACKLOG.md` |
 | Confused about how the two repos relate | `llm_plays_fe7/README.md` |
 | Investigating something in RAM | Spawn the `memory-investigator` agent |
+
+## Priorities when playing
+
+**Information gathering beats winning, and it is not close.** On a genuine conflict, take the
+information without deliberating — if learning something might get a unit killed or lose the
+chapter, do it anyway. Deaths, softlocks, corrupted saves and lost chapters are all fine;
+Grant keeps a complete backup. Never ask permission before a risky or destructive experiment.
+
+Read state from memory, never from screenshots. `RUNBOOK.md` has the rest.
 
 ## After editing any `src/*.ts`
 
