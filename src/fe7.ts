@@ -23,7 +23,8 @@
 
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { MgbaClient } from "./mgba.js";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, unlink, appendFile, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 
 // ── Addresses (US release, ROM title FIREEMBLEME / AGB-AE7E) ────────────────
 
@@ -681,6 +682,47 @@ async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Prom
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 14 }]);
     await sleep(420);
   }
+}
+
+// ── Run log ────────────────────────────────────────────────────────────────
+//
+// The point of a run is to find out what the tool layer cannot do. That list is
+// worthless if it lives in a conversation that ends, so it is written to disk as
+// it happens. TWO channels, because they catch different things:
+//
+//   1. Every fe7_* call and its result is appended automatically. This captures
+//      tools FAILING — refused destinations, unlocatable menus, targets out of
+//      range. No discipline required from the caller, and nothing is judged at
+//      write time: everything is logged and triaged later, because deciding what
+//      counts as a failure while writing is how you lose the interesting ones.
+//
+//   2. fe7_note, which the caller invokes deliberately. This captures tools
+//      MISSING, which channel 1 structurally cannot see: if there is no rescue
+//      action, nothing errors — the caller just never tries, and the log stays
+//      silent. An absence produces no failure. Only the player knows it wanted
+//      something that was not there.
+
+const RUN_LOG =
+  process.env.FE7_RUN_LOG ??
+  `${process.env.HOME}/Desktop/repos/llm_plays_fe7/runs/${new Date().toISOString().slice(0, 10)}.jsonl`;
+
+async function logLine(rec: Record<string, unknown>): Promise<void> {
+  try {
+    await mkdir(dirname(RUN_LOG), { recursive: true });
+    await appendFile(RUN_LOG, JSON.stringify({ t: new Date().toISOString(), ...rec }) + "\n");
+  } catch {
+    // Logging must never break play. A run that dies because its diary failed
+    // to write would be the stupidest possible way to lose an afternoon.
+  }
+}
+
+async function fe7Note(kind: string, detail: string, wanted: string): Promise<string> {
+  await logLine({ kind: "note", note_kind: kind, detail, wanted });
+  return (
+    `Recorded to the run log (${RUN_LOG}):\n  [${kind}] ${detail}` +
+    (wanted ? `\n  wanted: ${wanted}` : "") +
+    `\nCarry on — this is for the backlog afterwards, not something to wait on.`
+  );
 }
 
 // ── Tool implementations ───────────────────────────────────────────────────
@@ -1946,6 +1988,29 @@ export const FE7_TOOLS: Tool[] = [
     inputSchema: { type: "object", properties: {} },
   },
   {
+    name: "fe7_note",
+    description:
+      "PURPOSE: Record something the tool layer could not do, so it becomes a backlog item instead of being forgotten. " +
+      "USAGE: Call it the moment you want an action that does not exist ('I needed to rescue this unit and there is no rescue action'), find a tool too coarse or too blind to use well, have to work around a limitation, or hit something confusing you had to guess at. " +
+      "This is the ONLY way missing capabilities get recorded: a tool that does not exist never errors, so nothing else notices you wanted it. Tool FAILURES are logged automatically — do not re-report those; use this for gaps, workarounds, and confusion. " +
+      "Err on the side of recording. It costs one cheap call, it never blocks, and an over-full list is far more useful than a run that ends with 'it went fine' and no detail. " +
+      "BEHAVIOR: Appends one line to the run log and returns immediately. Changes nothing in the game. " +
+      "RETURNS: Confirmation and the log path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: {
+          type: "string",
+          enum: ["missing_action", "too_coarse", "workaround", "confusing", "wrong_result", "other"],
+          description: "'missing_action' — you wanted to do something with no tool for it. 'too_coarse' — a tool exists but cannot express what you needed. 'workaround' — you got there, but awkwardly. 'confusing' — you could not tell what was happening. 'wrong_result' — a tool reported something that turned out to be false.",
+        },
+        detail: { type: "string", description: "What happened, concretely — units, tiles, and what you were trying to achieve. Specific beats tidy." },
+        wanted: { type: "string", description: "What the tool layer should have let you do instead. A rough sketch of the call you wish existed is ideal." },
+      },
+      required: ["kind", "detail"],
+    },
+  },
+  {
     name: "fe7_end_turn",
     description:
       "PURPOSE: End the player phase and block until the player phase comes back, so the enemy phase runs without you polling for it. " +
@@ -1982,6 +2047,30 @@ export const FE7_TOOLS: Tool[] = [
 ];
 
 export async function handleFe7(
+  name: string,
+  p: Record<string, unknown>,
+  m: MgbaClient,
+): Promise<{ content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> } | null> {
+  const wrap = (text: string) => ({ content: [{ type: "text" as const, text }] });
+
+  if (name === "fe7_note") {
+    return wrap(await fe7Note(String(p.kind), String(p.detail), String(p.wanted ?? "")));
+  }
+
+  const started = Date.now();
+  const result = await dispatchFe7(name, p, m);
+  if (result) {
+    // Log everything, judge nothing. Whether a result was a failure is a
+    // question for triage afterwards, with the whole run visible.
+    const text = result.content
+      .map((c) => (c.type === "text" ? c.text : `[${c.type}]`))
+      .join("\n");
+    await logLine({ kind: "call", tool: name, params: p, ms: Date.now() - started, result: text.slice(0, 2000) });
+  }
+  return result;
+}
+
+async function dispatchFe7(
   name: string,
   p: Record<string, unknown>,
   m: MgbaClient,
