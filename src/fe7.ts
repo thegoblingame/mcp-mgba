@@ -37,7 +37,7 @@ const A = {
   enemyArray:   0x0202cec0,
   greenArray:   0x0202dcd0, // NPC / green faction, roster indices 0x41+
   textBuf:      0x0202a5b4, // decoded ASCII staging buffer
-  gridData:     0x030004ac, // movement grid row data (IWRAM)
+  gridTable:    0x03000440, // movement grid ROW-POINTER TABLE (IWRAM); its data follows it
   battleActor:  0x0203a3f0, // gBattleActor  — 128-byte BattleUnit
   battleTarget: 0x0203a470, // gBattleTarget — 128-byte BattleUnit
   uiArena:      0x02024000, // where menus and selection procs get allocated
@@ -79,10 +79,15 @@ const SLOT_CAP: Record<number, number> = {
   [0x0202cec0]: 50,
   [0x0202dcd0]: 11,
 };
-const GRID_W       = 24;     // bytes per movement-grid row
-const GRID_ROWS    = 27;     // rows in the buffer, including 2 top border rows
-const GRID_Y_OFF   = 2;      // row index = y + 2
-const MAP_H        = GRID_ROWS - GRID_Y_OFF;
+// The movement grid's geometry is PER CHAPTER. The game allocates it at map
+// load, sized to that map, so row count and stride are NOT constants:
+//   Lyn ch.1  = 14 rows x 17 bytes, data at 0x03000478
+//   Lyn ch.7  = 18 rows x 22 bytes, data at 0x03000488
+//   ch.22 HM  = 27 rows x 24 bytes, data at 0x030004AC
+// Hardcoding any one of these silently misreads every other map. Derive them
+// from the row-pointer table instead — see readGrid().
+const GRID_Y_OFF   = 2;      // row index = y + 2 (two top border rows)
+const GRID_PROBE   = 2048;   // table + data in ONE read for any observed map
 const CLASS_BASE   = 0x08be015c;
 const CLASS_STRIDE = 0x54;
 
@@ -263,27 +268,101 @@ async function readCursor(m: MgbaClient): Promise<{ x: number; y: number }> {
 
 // ── Movement grid ──────────────────────────────────────────────────────────
 //
-// Row-pointer table at 0x03000440 with base 0x03000448 for y=0; data is
-// contiguous at 0x030004AC, 27 rows of 24 bytes. row index = y + 2.
-// Value = movement cost spent to reach the tile; 0xFF = not reachable.
+// A table of 4-byte row pointers at A.gridTable, immediately followed by the
+// row data it points at. Value = movement cost spent to reach the tile;
+// 0xFF = not reachable. row index = y + 2.
+//
+// The geometry is derived, never assumed. The table ends exactly where its own
+// data begins, so the FIRST pointer tells you how long the table is and hence
+// how many rows there are; the gap between the first two gives the stride.
+// Confirmed on three maps: (0x478-0x440)/4 = 14, (0x488-0x440)/4 = 18,
+// (0x4AC-0x440)/4 = 27, with strides 17, 22 and 24.
+//
+// Do NOT walk the table looking for a terminator: ch.1 ends it with 0xFFFFFFFF
+// but ch.7 ends it with 0x00000000, so no single sentinel works.
 //
 // IMPORTANT: this is the PATHFINDING COST map. It includes tiles occupied by
 // other units (you may route through allies but not stop on them), so
 // `cost != 0xFF` alone is NOT a legal-destination test.
 
-async function readGrid(m: MgbaClient): Promise<number[][]> {
-  const bytes = await readRange(m, A.gridData, GRID_ROWS * GRID_W);
-  const rows: number[][] = [];
-  for (let y = 0; y < MAP_H; y++) {
-    const off = (y + GRID_Y_OFF) * GRID_W;
-    rows.push(bytes.slice(off, off + GRID_W));
+type GridGeom = {
+  stride: number;    // bytes per row, INCLUDING the 2 padding columns
+  rowCount: number;  // rows in the buffer, including the 2 top border rows
+  width: number;     // playable columns (stride - 2)
+  height: number;    // addressable rows (rowCount - GRID_Y_OFF)
+  rowPtrs: number[];
+};
+
+type Grid = GridGeom & { rows: number[][] };
+
+/** Derive the grid's shape from the head of its own pointer table. */
+function parseGridGeom(buf: number[]): GridGeom {
+  const p0 = u32(buf, 0), p1 = u32(buf, 4);
+  const tableBytes = p0 - A.gridTable;
+  if (tableBytes <= 0 || tableBytes % 4 !== 0 || tableBytes > 512) {
+    throw new Error(
+      `movement grid: first row pointer 0x${p0.toString(16)} is not a plausible end for the ` +
+      `table at 0x${A.gridTable.toString(16)} (implies ${tableBytes} table bytes). ` +
+      `The grid is probably not allocated — is a map loaded?`);
   }
-  return rows;
+  const rowCount = tableBytes / 4;
+  const stride = p1 - p0;
+  if (stride <= 2 || stride > 64) {
+    throw new Error(`movement grid: implausible row stride ${stride} from pointers ` +
+      `0x${p0.toString(16)} / 0x${p1.toString(16)}.`);
+  }
+  const rowPtrs: number[] = [];
+  for (let i = 0; i < rowCount; i++) rowPtrs.push(u32(buf, i * 4));
+  return { stride, rowCount, width: stride - 2, height: rowCount - GRID_Y_OFF, rowPtrs };
 }
 
-function gridCost(grid: number[][], x: number, y: number): number {
-  if (y < 0 || y >= grid.length || x < 0 || x >= GRID_W) return UNREACHABLE;
-  return grid[y][x];
+async function readGrid(m: MgbaClient): Promise<Grid> {
+  // One read covers table AND data, since the data begins where the table ends.
+  const probe = await readRange(m, A.gridTable, GRID_PROBE);
+  const g = parseGridGeom(probe);
+  const need = (g.rowPtrs[g.rowCount - 1] - A.gridTable) + g.stride;
+  // Read exactly what the grid occupies and never a byte more — over-reading is
+  // what let unrelated IWRAM be presented as movement cost, and a stray 0x00
+  // past the end decodes as "cost 0 = legal destination".
+  const bytes = need <= probe.length ? probe : await readRange(m, A.gridTable, need);
+  const rows: number[][] = [];
+  for (let y = 0; y < g.height; y++) {
+    const off = g.rowPtrs[y + GRID_Y_OFF] - A.gridTable;
+    rows.push(bytes.slice(off, off + g.stride));
+  }
+  return { ...g, rows };
+}
+
+/** Just the shape, for callers that need bounds but not costs. */
+async function readGridGeometry(m: MgbaClient): Promise<GridGeom> {
+  return parseGridGeom(await readRange(m, A.gridTable, 8));
+}
+
+/** The tile the grid marks cost 0 — i.e. who the game thinks is selected. */
+function gridOrigin(grid: Grid): { x: number; y: number } | null {
+  for (let y = 0; y < grid.height; y++) {
+    for (let x = 0; x < grid.stride; x++) if (grid.rows[y][x] === 0) return { x, y };
+  }
+  return null;
+}
+
+// The cheapest possible check that the grid was decoded correctly: cost 0 must
+// land on the unit we selected. Every historical misread of this structure --
+// wrong stride, wrong base, stale buffer -- fails exactly here.
+function gridMismatch(grid: Grid, u: { x: number; y: number }): string | null {
+  const o = gridOrigin(grid);
+  if (!o) return `movement grid holds no cost-0 tile — it was not populated for this unit.`;
+  if (o.x !== u.x || o.y !== u.y) {
+    return `movement grid decoded WRONG: cost 0 is at (${o.x},${o.y}) but the unit is at ` +
+      `(${u.x},${u.y}). Refusing to act on it. ` +
+      `[${grid.rowCount} rows x stride ${grid.stride}]`;
+  }
+  return null;
+}
+
+function gridCost(grid: Grid, x: number, y: number): number {
+  if (y < 0 || y >= grid.height || x < 0 || x >= grid.stride) return UNREACHABLE;
+  return grid.rows[y][x];
 }
 
 // ── Cursor driving ─────────────────────────────────────────────────────────
@@ -341,22 +420,67 @@ async function moveCursorTo(m: MgbaClient, tx: number, ty: number, timeoutMs = 2
 // whatever submenu opened and try again. B is always safe here — Attack and
 // Item both require a further confirm, so nothing is spent by backing out.
 
-async function commitWait(m: MgbaClient, arrayAddr: number, slot: number, attempts = 4): Promise<boolean> {
+// Confirming Wait by the has-acted flag ALONE is a trap. If this unit was the
+// last unspent one, its Wait ends the player phase; the enemy phase runs and the
+// new turn CLEARS has-acted again. The flag then reads 0 for the best possible
+// reason, the retry fires, and by then no menu is open — so "Up, A" lands on the
+// live map, walking the cursor up one tile and pressing A on whatever is there.
+// That is exactly the cursor drift observed across Lyn ch.1, and on empty ground
+// the A opens the FIELD menu, whose last entry (reached by the next retry's Up)
+// is End Turn. On a full roster that would end the phase with units unmoved.
+//
+// So latch turn and phase first: if either moved, the Wait landed. Only the turn
+// counter can tell "already acted" apart from "not acted yet".
+async function commitWait(
+  m: MgbaClient, arrayAddr: number, slot: number, attempts = 4,
+): Promise<{ ok: boolean; via: "flag" | "phase" | "nomenu"; turnBefore: number; turnAfter: number }> {
+  const c0 = await phaseClock(m);
+  let via: "flag" | "phase" = "flag";
+  let turnAfter = c0.turn;
+
   for (let i = 0; i < attempts; i++) {
-    await press(m, [
-      { buttons: ["Up"], frames: 4, release_frames: 14 },
-      { buttons: ["A"], frames: 4, release_frames: 14 },
-    ]);
+    // "Up" here is MENU navigation, not a map input — it wraps the action menu
+    // to its last entry, Wait. If no menu has focus it walks the MAP CURSOR
+    // instead, and the A behind it lands on the board: on empty ground that
+    // opens the field menu, whose last entry (one more Up) is End Turn. That is
+    // how a retry could silently end the phase with units unmoved.
+    //
+    // So make the press verifiable rather than blind: press Up, then read the
+    // live cursor. A menu swallows Up and the cursor holds still; a bare map
+    // does not. Only fire A once we know something has focus.
+    const cur0 = await readCursor(m);
+    await press(m, [{ buttons: ["Up"], frames: 4, release_frames: 14 }]);
+    await sleep(120);
+    const cur1 = await readCursor(m);
+
+    if (cur1.x !== cur0.x || cur1.y !== cur0.y) {
+      // The cursor moved, so there was no menu. Put it back and stop — do NOT
+      // send A at the board. Retrying cannot help: input is plainly being
+      // accepted, so the menu is gone because the action already resolved.
+      await press(m, [{ buttons: ["Down"], frames: 4, release_frames: 14 }]);
+      const c = await phaseClock(m);
+      if (c.phase !== c0.phase || c.turn !== c0.turn) {
+        return { ok: true, via: "phase", turnBefore: c0.turn, turnAfter: c.turn };
+      }
+      return { ok: false, via: "nomenu", turnBefore: c0.turn, turnAfter: c.turn };
+    }
+
+    // Cursor held still: a menu has focus, or input is being swallowed. A is the
+    // right press for both. (At y = 0 the map edge also blocks Up, so the test is
+    // inconclusive there — press A anyway and let the checks below decide. That
+    // is the steamroller default: a wasted press beats a stall.)
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 14 }]);
     const done = await waitUntil(async () => {
-      const u = await readUnit(m, arrayAddr, slot);
+      const [c, u] = await Promise.all([phaseClock(m), readUnit(m, arrayAddr, slot)]);
+      if (c.phase !== c0.phase || c.turn !== c0.turn) { via = "phase"; turnAfter = c.turn; return true; }
       return !!u && u.acted;
     }, 900);
-    if (done) return true;
+    if (done) return { ok: true, via, turnBefore: c0.turn, turnAfter };
     // Something else opened (item list / attack targeting). Unwind and retry.
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
     await sleep(120);
   }
-  return false;
+  return { ok: false, via: "flag", turnBefore: c0.turn, turnAfter: c0.turn };
 }
 
 // ── ASCII staging buffer ───────────────────────────────────────────────────
@@ -673,12 +797,38 @@ async function unwind(m: MgbaClient, slot: number, startX: number, startY: numbe
  * until three A presses dismissed the level-up, at which point everything landed
  * at once. A single post-action read is not enough for any action granting exp.
  */
-async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Promise<boolean> {
+/** Turn clock, for telling "already acted" apart from "not acted yet". */
+async function phaseClock(m: MgbaClient): Promise<{ phase: number; turn: number }> {
+  const b = await readRange(m, A.phase, 2);
+  return { phase: b[0], turn: b[1] };
+}
+
+type Commit = { ok: boolean; via: "flag" | "phase" | "discard"; turnBefore: number; turnAfter: number };
+
+// This polls has-acted AND presses A to clear dialogue (level-up, battle result,
+// item-use text) that would otherwise stall forever. Two hazards, both hit live:
+//
+//  1. If this unit was the last unspent one, its action ends the player phase and
+//     the NEW TURN CLEARS has-acted. Polling the flag alone then reads "never
+//     committed" for an action that committed perfectly — and the loop keeps
+//     pressing A. At 420ms over a 12s item timeout that is ~28 blind A presses
+//     into a live map. Latch the turn clock and stop the moment it moves.
+//  2. Never press A while the text buffer reads "Discard." — that is the item
+//     sub-menu's other entry, and one more A there destroys the item. Observed
+//     live on Lyn ch.1 with a Vulnerary. Bail out instead.
+async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Promise<Commit> {
+  const c0 = await phaseClock(m);
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const v = await readUnit(m, A.playerArray, slot);
-    if (v?.acted) return true;
-    if (Date.now() >= deadline) return false;
+    const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
+    if (c.phase !== c0.phase || c.turn !== c0.turn) {
+      return { ok: true, via: "phase", turnBefore: c0.turn, turnAfter: c.turn };
+    }
+    if (v?.acted) return { ok: true, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
+    if (Date.now() >= deadline) return { ok: false, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
+    if (/discard/i.test(await readText(m))) {
+      return { ok: false, via: "discard", turnBefore: c0.turn, turnAfter: c.turn };
+    }
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 14 }]);
     await sleep(420);
   }
@@ -809,6 +959,11 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
   }
 
   const grid = await readGrid(m);
+  const bad = gridMismatch(grid, u);
+  if (bad) {
+    if (!keepSelected) await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
+    return bad;
+  }
 
   const occMap = occupancy(
     { units: players.filter((p) => p.slot !== slot), mark: "U" },
@@ -819,12 +974,12 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
   for (const [k, v] of occMap) occupied.set(k, v.mark);
 
   // Bound the printed map to the interesting rows so output stays compact.
-  let minY = MAP_H, maxY = -1, minX = GRID_W, maxX = -1;
+  let minY = grid.height, maxY = -1, minX = grid.stride, maxX = -1;
   const tiles: Array<{ x: number; y: number; cost: number }> = [];
-  for (let y = 0; y < MAP_H; y++) {
-    for (let x = 0; x < GRID_W; x++) {
-      if (grid[y][x] !== UNREACHABLE) {
-        tiles.push({ x, y, cost: grid[y][x] });
+  for (let y = 0; y < grid.height; y++) {
+    for (let x = 0; x < grid.stride; x++) {
+      if (grid.rows[y][x] !== UNREACHABLE) {
+        tiles.push({ x, y, cost: grid.rows[y][x] });
         if (y < minY) minY = y; if (y > maxY) maxY = y;
         if (x < minX) minX = x; if (x > maxX) maxX = x;
       }
@@ -838,12 +993,13 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
     const legal = tiles.filter((t) => !occupied.has(`${t.x},${t.y}`));
     L.push(`Unit #${slot} cls${hex2(u.classId)} at (${u.x},${u.y}) — ${tiles.length} tiles in cost map, ${legal.length} legal destinations (unoccupied).`);
     L.push(`max cost ${Math.max(...tiles.map((t) => t.cost))} (= Move)`);
+    L.push(`map ${grid.width}x${grid.height} (grid ${grid.rowCount} rows x stride ${grid.stride}, derived from the row-pointer table)`);
     const pad = (s: string) => s.padStart(2, " ");
     L.push(`     ${Array.from({ length: maxX - minX + 1 }, (_, i) => pad(String(minX + i))).join("")}`);
     for (let y = minY; y <= maxY; y++) {
       let row = "";
       for (let x = minX; x <= maxX; x++) {
-        const c = grid[y][x];
+        const c = grid.rows[y][x];
         if (c === UNREACHABLE) row += " .";
         else row += pad(occupied.get(`${x},${y}`) ?? String(c));
       }
@@ -919,6 +1075,11 @@ async function prologue(
   // 2. Validate the destination against the game's own cost map BEFORE pressing.
   //    This is what makes a later failure diagnosable.
   const grid = await readGrid(m);
+  const bad = gridMismatch(grid, { x: startX, y: startY });
+  if (bad) {
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
+    return { ok: false, text: `${bad} Move cancelled; unit #${slot} still at (${startX},${startY}) and unspent.` };
+  }
   const cost = gridCost(grid, destX, destY);
   if (cost === UNREACHABLE) {
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
@@ -995,10 +1156,27 @@ async function fe7Act(
 
 
   if (action === "wait") {
-    const committed = await commitWait(m, A.playerArray, slot);
+    const w = await commitWait(m, A.playerArray, slot);
     const v = await readUnit(m, A.playerArray, slot);
+    if (w.ok && w.via === "phase") {
+      return {
+        text: `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, Wait committed. ` +
+          `It was the last unspent unit, so the player phase ended (turn ${w.turnBefore} -> ${w.turnAfter}). ` +
+          `Its has-acted flag has already been cleared by the new turn — that is success, not failure.`,
+      };
+    }
+    if (!w.ok && w.via === "nomenu") {
+      return {
+        text:
+          `Unit #${slot} MOVED to (${destX},${destY}) cost ${cost}, but Wait was NOT confirmed and the action menu ` +
+          `was not open when the retry ran — the Up press moved the map cursor instead, so nothing had focus. ` +
+          `Cursor restored and NO A was sent at the board (that is what could otherwise open the field menu and ` +
+          `end the phase). Unit's +0x0C = 0x${hex2((v?.flags ?? 0) & 0xff)}; the turn did not advance. ` +
+          `The move landed; re-issue the action if the unit is still unspent.`,
+      };
+    }
     return {
-      text: committed
+      text: w.ok
         ? `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, Wait committed (+0x0C = 0x42).`
         : `Unit #${slot} MOVED to (${destX},${destY}) but Wait did not commit after retries (+0x0C = 0x${hex2((v?.flags ?? 0) & 0xff)}). The action menu is probably still open.`,
     };
@@ -1100,9 +1278,15 @@ async function fe7Act(
       return !!v && v.acted;
     }, 25000, 150);
 
-    // Combat + animation can run long; wait on the unit becoming spent.
+    // Combat + animation can run long; wait on the unit becoming spent. As with
+    // Wait and Item, a unit that was the last unspent one ends the phase, and the
+    // new turn clears has-acted — so the turn clock, not the flag, is the truth.
+    // This path presses nothing while polling, so the old bug only mis-REPORTED.
+    const clk0 = await phaseClock(m);
+    let endedPhase = false;
     const done = await waitUntil(async () => {
-      const v = await readUnit(m, A.playerArray, slot);
+      const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
+      if (c.phase !== clk0.phase || c.turn !== clk0.turn) { endedPhase = true; return true; }
       return !!v && v.acted;
     }, 20000, 100);
 
@@ -1116,7 +1300,10 @@ async function fe7Act(
       .join(", ");
     return {
       text: done
-        ? `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp}, +0x0C=0x${hex2((self?.flags ?? 0) & 0xff)}.${forecast}`
+        ? `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp}, ` +
+          (endedPhase
+            ? `and it was the last unspent unit, so the player phase ended.${forecast}`
+            : `+0x0C=0x${hex2((self?.flags ?? 0) & 0xff)}.${forecast}`)
         : `Unit #${slot} moved to (${destX},${destY}) and Attack was chosen, but the unit never became spent within 20s. Enemy HP: ${deltas}. Something is still on screen.`,
     };
   }
@@ -1267,10 +1454,28 @@ async function fe7Act(
 
       const beforeHp = (await readUnit(m, A.playerArray, slot))?.hp ?? u.hp;
       await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
-      const committed = await awaitCommit(m, slot, 12000);
+      const c = await awaitCommit(m, slot, 12000);
       const after = await readUnit(m, A.playerArray, slot);
       const note = await readText(m);
-      if (!committed) {
+      if (c.ok && c.via === "phase") {
+        return {
+          text:
+            `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, used item ` +
+            `${hex2(u.items[wantInvSlot].id)} (inv slot ${wantInvSlot}). HP ${beforeHp} -> ${after?.hp}/${after?.maxHp}. ` +
+            `It was the last unspent unit, so the player phase ended (turn ${c.turnBefore} -> ${c.turnAfter}); ` +
+            `its has-acted flag has already been cleared by the new turn — that is success, not failure.`,
+        };
+      }
+      if (c.via === "discard") {
+        await unwind(m, slot, startX, startY);
+        return {
+          text:
+            `ABORTED before pressing A again: the text buffer read "Discard.", meaning the highlight was on the ` +
+            `item sub-menu's Discard entry, not Use. One more A would have destroyed item ` +
+            `${hex2(u.items[wantInvSlot].id)}. HP ${beforeHp} -> ${after?.hp}. Backed out; unit #${slot} unspent.`,
+        };
+      }
+      if (!c.ok) {
         // A full-HP unit produces IDENTICAL menu shapes and simply refuses. The
         // menus never tell you an item is unusable — only the effect does.
         await unwind(m, slot, startX, startY);
@@ -1317,11 +1522,20 @@ async function fe7Act(
     }
 
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
-    const committed = await awaitCommit(m, slot, 25000);
+    const c = await awaitCommit(m, slot, 25000);
     const tgtAfter = await readUnit(m, wantArray, targetSlot as number);
     const self = await readUnit(m, A.playerArray, slot);
     const staffId = u.items[wantInvSlot]?.id ?? 0;
-    if (!committed) {
+    if (c.ok && c.via === "phase") {
+      return {
+        text:
+          `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, used staff ${hex2(staffId)} on ` +
+          `${targetFaction} #${targetSlot} — HP ${tgtBefore.hp} -> ${tgtAfter?.hp}/${tgtAfter?.maxHp} ` +
+          `(+${(tgtAfter?.hp ?? 0) - tgtBefore.hp}). It was the last unspent unit, so the player phase ended ` +
+          `(turn ${c.turnBefore} -> ${c.turnAfter}); the cleared has-acted flag is success, not failure.`,
+      };
+    }
+    if (!c.ok) {
       return { text: `Unit #${slot} selected ${targetFaction} #${targetSlot} for staff ${hex2(staffId)} but never became spent. Target HP ${tgtBefore.hp} -> ${tgtAfter?.hp}. Something is still on screen.` };
     }
     return {
@@ -1819,13 +2033,14 @@ async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
     ).keys(),
   );
 
+  const geom = await readGridGeometry(m);
   const cur = await readCursor(m);
   let spot: { x: number; y: number } | null = null;
   for (let r = 0; r < 12 && !spot; r++) {
     for (let dy = -r; dy <= r && !spot; dy++) {
       for (let dx = -r; dx <= r && !spot; dx++) {
         const x = cur.x + dx, y = cur.y + dy;
-        if (x < 0 || y < 0 || x >= GRID_W || y >= MAP_H) continue;
+        if (x < 0 || y < 0 || x >= geom.width || y >= geom.height) continue;
         if (!taken.has(`${x},${y}`)) spot = { x, y };
       }
     }
@@ -2058,7 +2273,14 @@ export async function handleFe7(
   }
 
   const started = Date.now();
-  const result = await dispatchFe7(name, p, m);
+  let result: Awaited<ReturnType<typeof dispatchFe7>>;
+  try {
+    result = await dispatchFe7(name, p, m);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await logLine({ kind: "call", tool: name, params: p, ms: Date.now() - started, result: `THREW: ${msg}` });
+    return wrap(`${name} failed: ${msg}`);
+  }
   if (result) {
     // Log everything, judge nothing. Whether a result was a failure is a
     // question for triage afterwards, with the whole run visible.
