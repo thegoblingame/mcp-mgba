@@ -963,10 +963,29 @@ async function fe7Act(
   }
 
   if (action === "attack") {
-    const adj = enemies.filter((e) => !e.dead && Math.abs(e.x - destX) + Math.abs(e.y - destY) === 1);
+    // Range comes from the WEAPONS THIS UNIT CAN ACTUALLY USE, not from an
+    // assumption of melee. Hardcoding distance == 1 silently refused every hand
+    // axe, bow and tome attack and made the unit Wait instead — wasting the turn
+    // and reporting "no enemy is adjacent", which was true and irrelevant.
+    let minR = 99, maxR = 0;
+    for (const it of u.items) {
+      const t = await itemType(m, it.id);
+      if (t === WTYPE_STAFF || t === 9 || u.ranks[t] === 0) continue;
+      const r = await itemRange(m, it.id);
+      if (r.max > maxR) maxR = r.max;
+      if (r.min < minR) minR = r.min;
+    }
+    const adj = maxR === 0 ? [] : enemies.filter((e) => {
+      if (e.dead) return false;
+      const d = Math.abs(e.x - destX) + Math.abs(e.y - destY);
+      return d >= minR && d <= maxR;
+    });
     if (adj.length === 0) {
       const committed = await commitWait(m, A.playerArray, slot);
-      return { text: `Unit #${slot} moved to (${destX},${destY}) but no enemy is adjacent, so Attack is unavailable. ${committed ? "Waited instead." : "Wait also failed to commit."}` };
+      const why = maxR === 0
+        ? `unit #${slot} has no usable weapon (inventory ${u.items.map((i) => hex2(i.id)).join(",") || "empty"})`
+        : `no enemy is within its weapon range ${minR}-${maxR} of (${destX},${destY})`;
+      return { text: `Unit #${slot} moved to (${destX},${destY}) but Attack is unavailable — ${why}. ${committed ? "Waited instead." : "Wait also failed to commit."}` };
     }
     const before = adj.map((e) => ({ slot: e.slot, hp: e.hp }));
 
