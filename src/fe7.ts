@@ -816,7 +816,7 @@ async function phaseClock(m: MgbaClient): Promise<{ phase: number; turn: number 
   return { phase: b[0], turn: b[1] };
 }
 
-type Commit = { ok: boolean; via: "flag" | "phase" | "discard"; turnBefore: number; turnAfter: number };
+type Commit = { ok: boolean; via: "flag" | "phase"; turnBefore: number; turnAfter: number };
 
 // This polls has-acted AND presses A to clear dialogue (level-up, battle result,
 // item-use text) that would otherwise stall forever. Two hazards, both hit live:
@@ -826,9 +826,7 @@ type Commit = { ok: boolean; via: "flag" | "phase" | "discard"; turnBefore: numb
 //     committed" for an action that committed perfectly — and the loop keeps
 //     pressing A. At 420ms over a 12s item timeout that is ~28 blind A presses
 //     into a live map. Latch the turn clock and stop the moment it moves.
-//  2. Never press A while the text buffer reads "Discard." — that is the item
-//     sub-menu's other entry, and one more A there destroys the item. Observed
-//     live on Lyn ch.1 with a Vulnerary. Bail out instead.
+//  2. (WITHDRAWN — see below.) There is no text-based guard here any more.
 async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Promise<Commit> {
   const c0 = await phaseClock(m);
   const deadline = Date.now() + timeoutMs;
@@ -839,9 +837,18 @@ async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Prom
     }
     if (v?.acted) return { ok: true, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
     if (Date.now() >= deadline) return { ok: false, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
-    if (/discard/i.test(await readText(m))) {
-      return { ok: false, via: "discard", turnBefore: c0.turn, turnAfter: c.turn };
-    }
+    // NO "Discard." guard. It was added on a misreading and has been removed.
+    // The text buffer holds the LAST entry a menu RENDERED, not the highlighted
+    // one — confirmed on three menus: field menu -> "End.", action menu ->
+    // "Wait", item sub-menu -> "Discard.", each the bottom entry, and stepping
+    // the action menu's highlight six times never changed the string. So
+    // "Discard." means only "the item sub-menu is open", which is exactly where
+    // a legitimate item use also happens. Guarding on it would abort real uses
+    // while proving nothing about where the highlight actually sits.
+    //
+    // Knowing where the highlight is needs the menu's own index byte, which
+    // locateMenu()/menuGoTo() already read and verify. Any future guard belongs
+    // there, not on this string.
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 14 }]);
     await sleep(420);
   }
@@ -1525,15 +1532,6 @@ async function fe7Act(
             `${hex2(u.items[wantInvSlot].id)} (inv slot ${wantInvSlot}). HP ${beforeHp} -> ${after?.hp}/${after?.maxHp}. ` +
             `It was the last unspent unit, so the player phase ended (turn ${c.turnBefore} -> ${c.turnAfter}); ` +
             `its has-acted flag has already been cleared by the new turn — that is success, not failure.`,
-        };
-      }
-      if (c.via === "discard") {
-        await unwind(m, slot, startX, startY);
-        return {
-          text:
-            `ABORTED before pressing A again: the text buffer read "Discard.", meaning the highlight was on the ` +
-            `item sub-menu's Discard entry, not Use. One more A would have destroyed item ` +
-            `${hex2(u.items[wantInvSlot].id)}. HP ${beforeHp} -> ${after?.hp}. Backed out; unit #${slot} unspent.`,
         };
       }
       if (!c.ok) {
