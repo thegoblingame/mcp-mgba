@@ -77,6 +77,18 @@ one that silently cost a unit its turn. Save a state first (`save_state` to an e
   at old addresses, looking perfectly plausible. Locate them by behaviour and verify.
 - **Derive menu indices; do not scan for them.** Scanning means pressing A on entries you
   cannot identify in advance. That committed Wait once and cost a unit its turn.
+- **Never hardcode anything the game computes per chapter.** Map geometry, grid strides, row
+  counts, menu addresses and menu entry positions are all allocated per map or per instance.
+  Derive them from the game's own tables every time. A stride measured on Ch.22 and frozen
+  into a `const` made Lyn Ch.1 unwinnable and invented ~300 phantom destinations on Ch.7 —
+  and the same Ch.22 row count had been hardcoded a second time, in a different structure.
+- **Keep inferred values away from array bounds.** An inferred playable size and a raw count
+  read from a table are different numbers with opposite failure costs: too-tight bounds turn
+  reachable tiles into `0xFF`, which is the same chapter-blocking bug from the other side.
+  `readGrid` keeps `indexRows`/`stride` (raw) separate from `height`/`width` (inferred).
+- **Assert the cheap invariant.** `gridMismatch` requires the cost-0 tile to equal the
+  selected unit's position. One comparison, runs on every call, and it catches every variant
+  of a misdecoded grid on every map. Written rules did not prevent this bug; that check does.
 - **Long-running tools must be resumable.** Any call that can exceed ~110s gets split into a
   short starter and a resumable waiter, as `fe7_end_turn` / `fe7_wait` are.
 
