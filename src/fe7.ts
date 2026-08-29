@@ -682,6 +682,50 @@ async function locateMenu(m: MgbaClient): Promise<{ addr: number; count: number;
   return null;
 }
 
+// ── Identifying a menu entry without pressing anything ─────────────────────
+//
+// The text buffer CANNOT do this: it only ever names a menu's LAST entry (it is a
+// decode staging buffer, and painting a menu decodes top to bottom). Stepping the
+// highlight never changes it. So identity comes from the menu structure instead.
+//
+// Around the index byte that locateMenu() returns:
+//   -0x01  u8  entry count
+//   -0x2D  u32[count]  pointers to per-entry structs, IN MENU ORDER
+// and inside each entry struct:
+//   +0x30  u32  ROM pointer identifying the COMMAND
+//
+// The ROM pointer is the stable identity. Verified across two chapters: Wait reads
+// 0x08B956BC on both Lyn ch.1 and ch.7 — different arena slots, different menu
+// sizes. The EWRAM addresses are NOT stable and must never be hardcoded: slot
+// 0x0202547C held Attack on ch.7 and Wait on ch.1.
+const MENU_CMD = {
+  seize:  0x08b95314,
+  attack: 0x08b95338,
+  item:   0x08b9562c,
+  trade:  0x08b95650,
+  wait:   0x08b956bc,
+} as const;
+
+const MENU_PTRS_OFF = 0x2d;  // entry-pointer array, BELOW the index byte
+const ENTRY_CMD_OFF = 0x30;  // ROM command pointer inside an entry struct
+
+/** ROM command pointer of every entry of an open menu, in menu order. Pure read. */
+async function menuEntryCmds(m: MgbaClient, menuAddr: number, count: number): Promise<number[]> {
+  const ptrs = await readRange(m, menuAddr - MENU_PTRS_OFF, count * 4);
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const entry = u32(ptrs, i * 4);
+    // Entry structs live in the UI arena; anything else means the offset is wrong
+    // on this menu shape rather than that the entry is exotic.
+    if (entry < A.uiArena || entry >= A.uiArena + 0x8000) { out.push(0); continue; }
+    out.push(u32(await readRange(m, entry + ENTRY_CMD_OFF, 4), 0));
+  }
+  return out;
+}
+
+const cmdName = (v: number) =>
+  (Object.entries(MENU_CMD).find(([, p]) => p === v)?.[0]) ?? `0x${v.toString(16)}`;
+
 /** Move a menu highlight from its current index to `to`, wrapping downward. */
 async function menuGoTo(m: MgbaClient, menuAddr: number, to: number, count: number): Promise<boolean> {
   for (let guard = 0; guard < count + 2; guard++) {
@@ -1247,6 +1291,41 @@ async function fe7Act(
       text: w.ok
         ? `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, Wait committed (+0x0C = 0x42).`
         : `Unit #${slot} MOVED to (${destX},${destY}) but Wait did not commit after retries (+0x0C = 0x${hex2((v?.flags ?? 0) & 0xff)}). The action menu is probably still open.`,
+    };
+  }
+
+  if (action === "seize") {
+    const menu = await locateMenu(m);
+    if (!menu) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Could not locate unit #${slot}'s action menu at (${destX},${destY}). Backed out; unit unspent.` };
+    }
+    const cmds = await menuEntryCmds(m, menu.addr, menu.count);
+    const idx = cmds.indexOf(MENU_CMD.seize);
+    const shape = cmds.map(cmdName).join(", ");
+    if (idx < 0) {
+      await unwind(m, slot, startX, startY);
+      return {
+        text:
+          `No Seize entry on unit #${slot}'s action menu at (${destX},${destY}) — the menu holds [${shape}]. ` +
+          `Either this tile is not the objective, or this unit is not a lord. Nothing was pressed; unit unspent at (${startX},${startY}).`,
+      };
+    }
+    if (!(await menuGoTo(m, menu.addr, idx, menu.count))) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Found Seize at index ${idx} of [${shape}] but could not move the highlight onto it. Backed out; unit unspent.` };
+    }
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    const c = await awaitCommit(m, slot, 15000);
+    const note = await readText(m);
+    return {
+      text: c.ok
+        ? `Unit #${slot}: (${startX},${startY}) -> (${destX},${destY}) cost ${cost}, SEIZED. ` +
+          `Menu was [${shape}], Seize at index ${idx}. ` +
+          (c.via === "phase" ? `Phase/turn moved (${c.turnBefore} -> ${c.turnAfter}). ` : `+0x0C set. `) +
+          `Text buffer: ${JSON.stringify(note)}.`
+        : `Unit #${slot} moved to (${destX},${destY}) and Seize (index ${idx} of [${shape}]) was chosen, but nothing ` +
+          `confirmed within 15s. Text buffer: ${JSON.stringify(note)}. Something is still on screen.`,
     };
   }
 
@@ -2246,12 +2325,13 @@ export const FE7_TOOLS: Tool[] = [
         y: { type: "number", description: "Destination tile y." },
         action: {
           type: "string",
-          enum: ["wait", "attack", "staff", "item"],
+          enum: ["wait", "attack", "staff", "item", "seize"],
           description:
             "'wait' ends the unit's turn on the destination tile, picked by wrapping the action menu UP to its last entry. That Up is MENU navigation, not a map input: it is verified by re-reading the cursor, because with no menu open it walks the map instead and the A behind it lands on the board. Commit is confirmed by the TURN CLOCK, not by the has-acted flag — if this is the last unspent unit its Wait ends the phase and the new turn clears that flag, which is success, not failure. " +
             "'attack' picks Attack and confirms against a target — pass target_slot to choose which enemy and have the choice VERIFIED before swinging. " +
             "'staff' heals with a staff: requires target_slot, and item_slot if the unit carries more than one staff. " +
             "'item' uses an item on the unit itself (a vulnerary); item_slot picks which, defaulting to the first. " +
+            "'seize' takes a gate or throne with a lord, completing a Seize chapter. The Seize entry is located by READING the menu — each entry's struct carries a ROM pointer identifying its command — so it never presses A on an entry it cannot name. If no Seize entry exists it reports the whole menu's contents and backs out having pressed nothing. " +
             "Only 'wait' can end the turn without an effect — every other action confirms it landed and reports what changed.",
         },
         target_slot: {
