@@ -87,6 +87,7 @@ const SLOT_CAP: Record<number, number> = {
 // Hardcoding any one of these silently misreads every other map. Derive them
 // from the row-pointer table instead — see readGrid().
 const GRID_Y_OFF   = 2;      // row index = y + 2 (two top border rows)
+const GRID_Y_BOT   = 2;      // ...and two trailing border rows: height = rows - 4
 const GRID_PROBE   = 2048;   // table + data in ONE read for any observed map
 const CLASS_BASE   = 0x08be015c;
 const CLASS_STRIDE = 0x54;
@@ -287,9 +288,10 @@ async function readCursor(m: MgbaClient): Promise<{ x: number; y: number }> {
 
 type GridGeom = {
   stride: number;    // bytes per row, INCLUDING the 2 padding columns
-  rowCount: number;  // rows in the buffer, including the 2 top border rows
-  width: number;     // playable columns (stride - 2)
-  height: number;    // addressable rows (rowCount - GRID_Y_OFF)
+  rowCount: number;  // rows in the buffer, including BOTH border bands
+  width: number;     // playable columns (stride - 2) — inferred
+  height: number;    // playable rows (rowCount - 4) — inferred
+  indexRows: number; // addressable rows for INDEXING (rowCount - GRID_Y_OFF)
   rowPtrs: number[];
 };
 
@@ -313,7 +315,16 @@ function parseGridGeom(buf: number[]): GridGeom {
   }
   const rowPtrs: number[] = [];
   for (let i = 0; i < rowCount; i++) rowPtrs.push(u32(buf, i * 4));
-  return { stride, rowCount, width: stride - 2, height: rowCount - GRID_Y_OFF, rowPtrs };
+  // width = stride - 2 and height = rowCount - 4 are INFERRED, not proven: on ch.7
+  // the cursor hard-stops at (19,13) against stride 22 / 18 rows, and on ch.1 the
+  // last two rows read 0xFF in every grid decoded. `rows` is the raw count, so
+  // indexing never depends on the inference.
+  return {
+    stride, rowCount, rowPtrs,
+    width: stride - 2,
+    height: rowCount - GRID_Y_OFF - GRID_Y_BOT,
+    indexRows: rowCount - GRID_Y_OFF,
+  };
 }
 
 async function readGrid(m: MgbaClient): Promise<Grid> {
@@ -326,7 +337,7 @@ async function readGrid(m: MgbaClient): Promise<Grid> {
   // past the end decodes as "cost 0 = legal destination".
   const bytes = need <= probe.length ? probe : await readRange(m, A.gridTable, need);
   const rows: number[][] = [];
-  for (let y = 0; y < g.height; y++) {
+  for (let y = 0; y < g.indexRows; y++) {
     const off = g.rowPtrs[y + GRID_Y_OFF] - A.gridTable;
     rows.push(bytes.slice(off, off + g.stride));
   }
@@ -340,7 +351,7 @@ async function readGridGeometry(m: MgbaClient): Promise<GridGeom> {
 
 /** The tile the grid marks cost 0 — i.e. who the game thinks is selected. */
 function gridOrigin(grid: Grid): { x: number; y: number } | null {
-  for (let y = 0; y < grid.height; y++) {
+  for (let y = 0; y < grid.rows.length; y++) {
     for (let x = 0; x < grid.stride; x++) if (grid.rows[y][x] === 0) return { x, y };
   }
   return null;
@@ -361,7 +372,9 @@ function gridMismatch(grid: Grid, u: { x: number; y: number }): string | null {
 }
 
 function gridCost(grid: Grid, x: number, y: number): number {
-  if (y < 0 || y >= grid.height || x < 0 || x >= grid.stride) return UNREACHABLE;
+  // Bound by the RAW row/stride counts, never the inferred playable size — a bad
+  // inference must not refuse a tile the game itself marks reachable.
+  if (y < 0 || y >= grid.indexRows || x < 0 || x >= grid.stride) return UNREACHABLE;
   return grid.rows[y][x];
 }
 
@@ -877,6 +890,54 @@ async function fe7Note(kind: string, detail: string, wanted: string): Promise<st
 
 // ── Tool implementations ───────────────────────────────────────────────────
 
+/**
+ * Read what the game says is on a tile, by parking the cursor there and reading
+ * the on-screen text buffer.
+ *
+ * This exists because the terrain ARRAY is still unlocated, so there is no way to
+ * ask "what is this tile" from memory directly. The cursor readout is the game's
+ * own answer and it is a memory read, not a screenshot — but it is a rendering,
+ * so it is reported raw rather than interpreted.
+ *
+ * The buffer does NOT always hold a terrain name; it also carries objective text
+ * and menu descriptions. So the caller gets the string verbatim plus the tile the
+ * cursor actually reached, and can judge. Never claim a tile "is" something the
+ * buffer did not say.
+ */
+async function fe7Inspect(m: MgbaClient, tiles: Array<{ x: number; y: number }>): Promise<string> {
+  const ps = await readRange(m, A.phase, 2);
+  if (ps[0] !== 0x00) return `Phase is 0x${hex2(ps[0])}, not the player phase — the cursor is not free. Try again on the player phase.`;
+
+  const geom = await readGridGeometry(m);
+  const L: string[] = [`map ${geom.width}x${geom.height} (derived: ${geom.rowCount} rows x stride ${geom.stride})`];
+
+  for (const t of tiles) {
+    if (t.x < 0 || t.y < 0 || t.x >= geom.stride || t.y >= geom.indexRows) {
+      L.push(`(${t.x},${t.y}) OFF-MAP — outside the grid entirely (stride ${geom.stride}, ${geom.indexRows} rows).`);
+      continue;
+    }
+    if (t.x >= geom.width || t.y >= geom.height) {
+      // The playable size is inferred, so try anyway: a stalled cursor is a
+      // truthful answer, a false refusal is not.
+      L.push(`(${t.x},${t.y}) is beyond the INFERRED map edge (${geom.width}x${geom.height}) — trying anyway.`);
+    }
+    if (!(await moveCursorTo(m, t.x, t.y))) {
+      const c = await readCursor(m);
+      L.push(`(${t.x},${t.y}) could not reach — cursor stalled at (${c.x},${c.y}). Input may be blocked.`);
+      continue;
+    }
+    // The readout follows the cursor a frame or two behind.
+    await sleep(220);
+    const c = await readCursor(m);
+    const text = await readText(m);
+    L.push(`(${c.x},${c.y}) text: ${JSON.stringify(text)}`);
+  }
+
+  L.push(`NOTE: this is the cursor readout, not a terrain array. It usually names the tile ` +
+    `("Plain."), but it also carries objective and menu text — read the raw string, do not assume.`);
+  return L.join("\n");
+}
+
 async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
   const [ps, players, enemies, greens, cur] = await Promise.all([
     readRange(m, A.phase, 2),
@@ -974,9 +1035,9 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
   for (const [k, v] of occMap) occupied.set(k, v.mark);
 
   // Bound the printed map to the interesting rows so output stays compact.
-  let minY = grid.height, maxY = -1, minX = grid.stride, maxX = -1;
+  let minY = grid.indexRows, maxY = -1, minX = grid.stride, maxX = -1;
   const tiles: Array<{ x: number; y: number; cost: number }> = [];
-  for (let y = 0; y < grid.height; y++) {
+  for (let y = 0; y < grid.indexRows; y++) {
     for (let x = 0; x < grid.stride; x++) {
       if (grid.rows[y][x] !== UNREACHABLE) {
         tiles.push({ x, y, cost: grid.rows[y][x] });
@@ -2128,6 +2189,31 @@ export const FE7_TOOLS: Tool[] = [
     },
   },
   {
+    name: "fe7_inspect",
+    description:
+      "PURPOSE: Ask the game what is on a tile — terrain name, village, gate — by moving the cursor there and reading its on-screen readout out of memory. " +
+      "USAGE: This is the ONLY way to identify a tile today: the terrain array is not located, so nothing can map the board. Use it to find a Seize gate, a village, or to check whether a tile is defensive terrain before parking a unit on it. Pass `tiles` to inspect several in one call; each one costs a cursor walk, so ask about candidates rather than sweeping a whole map. " +
+      "BEHAVIOR: Drives input, but only the D-pad — it moves the cursor and reads, never presses A or B, so it cannot select, commit or change anything. Refuses unless the player phase is active, since the cursor is not free otherwise. Tiles outside the real map (derived per chapter from the row-pointer table) are reported OFF-MAP rather than walked to. " +
+      "RETURNS: The map's derived dimensions, then one line per tile with the tile the cursor ACTUALLY reached and the readout string verbatim. " +
+      "IMPORTANT: the buffer is a rendering, not a terrain array — it usually holds the tile name (\"Plain.\") but also carries objective and menu text. Report the raw string; never assert a tile 'is' something the readout did not say.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "Tile x to inspect. Ignored if `tiles` is given." },
+        y: { type: "number", description: "Tile y to inspect. Ignored if `tiles` is given." },
+        tiles: {
+          type: "array",
+          description: "Several tiles to inspect in one call, in order. Each costs a cursor walk.",
+          items: {
+            type: "object",
+            properties: { x: { type: "number" }, y: { type: "number" } },
+            required: ["x", "y"],
+          },
+        },
+      },
+    },
+  },
+  {
     name: "fe7_reachable",
     description:
       "PURPOSE: Show exactly where a unit can move, read from the game's own movement cost map, as an ASCII grid annotated with which tiles are actually legal destinations. " +
@@ -2327,6 +2413,17 @@ async function dispatchFe7(
   switch (name) {
     case "fe7_state":
       return wrap(await fe7State(m, p.brief === true));
+
+    case "fe7_inspect": {
+      const raw = Array.isArray(p.tiles) ? (p.tiles as Array<Record<string, unknown>>) : null;
+      const tiles = raw
+        ? raw.map((t) => ({ x: Number(t.x), y: Number(t.y) }))
+        : [{ x: Number(p.x), y: Number(p.y) }];
+      if (tiles.some((t) => !Number.isFinite(t.x) || !Number.isFinite(t.y))) {
+        return wrap(`fe7_inspect needs x and y, or a tiles array of {x,y}.`);
+      }
+      return wrap(await fe7Inspect(m, tiles));
+    }
 
     case "fe7_reachable":
       return wrap(await fe7Reachable(m, Number(p.slot), p.keep_selected === true));
