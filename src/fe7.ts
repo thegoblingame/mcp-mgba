@@ -41,6 +41,8 @@ const A = {
   battleActor:  0x0203a3f0, // gBattleActor  — 128-byte BattleUnit
   battleTarget: 0x0203a470, // gBattleTarget — 128-byte BattleUnit
   uiArena:      0x02024000, // where menus and selection procs get allocated
+  mapSize:      0x0202e3d8, // u16 width, u16 height — gBmMapSize
+  mapLayers:    0x0202e3dc, // 7 u32 slots; each holds &table[2] (the +2 row border, pre-baked)
 } as const;
 
 const UI_ARENA_LEN = 8192;
@@ -93,6 +95,79 @@ const CLASS_BASE   = 0x08be015c;
 const CLASS_STRIDE = 0x54;
 
 const UNREACHABLE = 0xff;
+
+// ── Map layers ─────────────────────────────────────────────────────────────
+//
+// Seven statically-addressed layers, all the same shape, found 2026-08-29. The
+// slot bases are ROM literals (one literal pool at 0x08018E44) so they do NOT
+// vary per chapter — verified byte-identical on Lyn ch.7 and ch.22. Only the
+// geometry is per-map, and gBmMapSize gives that directly.
+//
+// Each slot holds `&table[2]`, i.e. the +2 top-border offset is ALREADY baked in,
+// so index by y directly with no adjustment.
+//
+// ⚠️ DOUBLE indirection. read32(slot) is the ROW-POINTER ARRAY, not the data:
+//     tile(x,y) = read8( read32( read32(slot) + 4*y ) + x )
+// Doing read32(slot + 4*y) walks the slot array itself and returns a grid that is
+// shifted by several rows and looks entirely plausible.
+const LAYER = { unit: 0, terrain: 1, movement: 2, range: 3, fog: 4, hidden: 5, other: 6 } as const;
+
+// Read out of the game by writing each ID to a tile and reading the cursor
+// readout; transcribed from RAM.md's table programmatically, not by hand.
+const TERRAIN_NAME: Record<number, string> = { 0:"-", 1:"Plain", 2:"Road", 3:"Village", 4:"Village", 5:"House", 6:"Armory", 7:"Vendor", 8:"Arena", 9:"C.Room", 10:"Fort", 11:"Gate", 12:"Forest", 13:"Thicket", 14:"Sand", 15:"Desert", 16:"River", 17:"Mntn", 18:"Peak", 19:"Bridge", 20:"Bridge", 21:"Sea", 22:"Lake", 23:"Floor", 24:"Floor", 25:"Fence", 26:"Wall", 27:"Wall", 28:"Rubble", 29:"Pillar", 30:"Door", 31:"Throne", 32:"Chest", 33:"Chest", 34:"Roof", 35:"Gate", 36:"Church", 37:"Ruins", 38:"Cliff", 39:"Ballista", 40:"Long B", 41:"Killer B", 42:"Flat", 43:"Wreck", 44:"-", 45:"Stairs", 46:"-", 47:"Glacier", 48:"Arena", 49:"Valley", 50:"Fence", 51:"Snag", 52:"Bridge", 53:"Sky", 54:"Deeps", 55:"Ruins", 56:"Inn", 57:"Barrel", 58:"Bone", 59:"Dark", 60:"Water", 61:"Gunnel", 62:"Deck", 63:"Brace", 64:"Mast" };
+
+const terrainName = (id: number) => TERRAIN_NAME[id] ?? `?${hex2(id)}`;
+
+async function readMapSize(m: MgbaClient): Promise<{ width: number; height: number }> {
+  const b = await readRange(m, A.mapSize, 4);
+  const width = u16(b, 0), height = u16(b, 2);
+  if (width < 1 || width > 64 || height < 1 || height > 64) {
+    throw new Error(`gBmMapSize reads ${width}x${height}, which is not a plausible map — is a chapter loaded?`);
+  }
+  return { width, height };
+}
+
+/** One whole map layer as rows[y][x]. Three reads regardless of map size. */
+async function readLayer(m: MgbaClient, slot: number, width: number, height: number): Promise<number[][]> {
+  const base = u32(await readRange(m, A.mapLayers + 4 * slot, 4), 0);
+  const ptrs = await readRange(m, base, height * 4);
+  const rowAddrs: number[] = [];
+  for (let y = 0; y < height; y++) rowAddrs.push(u32(ptrs, y * 4));
+  const lo = Math.min(...rowAddrs), hi = Math.max(...rowAddrs) + width;
+  if (hi - lo > 0x4000) throw new Error(`layer ${slot} rows span ${hi - lo} bytes — pointers look wrong.`);
+  const span = await readRange(m, lo, hi - lo);
+  return rowAddrs.map((a) => span.slice(a - lo, a - lo + width));
+}
+
+async function fe7Terrain(m: MgbaClient, find: string): Promise<string> {
+  const { width, height } = await readMapSize(m);
+  const rows = await readLayer(m, LAYER.terrain, width, height);
+
+  const L: string[] = [`map ${width}x${height} (gBmMapSize) — terrain IDs in hex`];
+  L.push(`     ${Array.from({ length: width }, (_, x) => String(x % 10)).join(" ")}`);
+  for (let y = 0; y < height; y++) {
+    L.push(`  ${String(y).padStart(2, " ")} ` + rows[y].map((v) => hex2(v)).join("").replace(/(..)/g, "$1").match(/.{1,2}/g)!.join(" "));
+  }
+
+  const seen = new Map<number, number>();
+  for (const row of rows) for (const v of row) seen.set(v, (seen.get(v) ?? 0) + 1);
+  L.push("");
+  L.push("legend (only IDs present on this map):");
+  for (const [id, n] of [...seen.entries()].sort((a, b) => a[0] - b[0])) {
+    L.push(`  ${hex2(id)} ${terrainName(id).padEnd(10)} x${n}`);
+  }
+
+  if (find) {
+    const re = new RegExp(find, "i");
+    const hits: string[] = [];
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) if (re.test(terrainName(rows[y][x]))) hits.push(`(${x},${y})=${terrainName(rows[y][x])}`);
+    }
+    L.push("");
+    L.push(hits.length ? `find /${find}/i -> ${hits.join(", ")}` : `find /${find}/i -> no tile on this map matches.`);
+  }
+  return L.join("\n");
+}
 
 // ── Low-level helpers ──────────────────────────────────────────────────────
 
@@ -2266,6 +2341,24 @@ export const FE7_TOOLS: Tool[] = [
     },
   },
   {
+    name: "fe7_terrain",
+    description:
+      "PURPOSE: Read the WHOLE board's terrain in one call — every tile's type, as an ID grid plus a named legend — from the game's own terrain array. " +
+      "USAGE: This is how you answer 'where is the gate', 'where are the villages', 'which tiles are defensive' and 'what is impassable', without walking the cursor anywhere. Pass `find` with a name pattern (e.g. 'gate', 'village|house', 'fort') to get the matching tiles' coordinates listed. Call it once at the start of a chapter and again if you suspect the map changed — terrain IS mutable at runtime (a door opening, a wall breaking), so do not cache it across turns indefinitely. " +
+      "BEHAVIOR: Pure read, no input, no side effects. Three reads regardless of map size. Dimensions come from gBmMapSize and the layer bases are ROM literals, so nothing is hardcoded per chapter. " +
+      "RETURNS: The map's real dimensions, a grid of terrain IDs in hex, a legend naming only the IDs actually present with tile counts, and the `find` hits if a pattern was given. " +
+      "NOTE: this is terrain ONLY — it says nothing about who is standing where. Cross-check occupancy against fe7_state, and remember the cost map is what decides whether a unit may STOP on a tile.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        find: {
+          type: "string",
+          description: "Case-insensitive regex matched against terrain NAMES; matching tiles are listed with coordinates. E.g. 'gate' to locate a seize objective, 'village|house' for visitable tiles, 'fort' for healing tiles.",
+        },
+      },
+    },
+  },
+  {
     name: "fe7_inspect",
     description:
       "PURPOSE: Ask the game what is on a tile — terrain name, village, gate — by moving the cursor there and reading its on-screen readout out of memory. " +
@@ -2491,6 +2584,9 @@ async function dispatchFe7(
   switch (name) {
     case "fe7_state":
       return wrap(await fe7State(m, p.brief === true));
+
+    case "fe7_terrain":
+      return wrap(await fe7Terrain(m, p.find === undefined ? "" : String(p.find)));
 
     case "fe7_inspect": {
       const raw = Array.isArray(p.tiles) ? (p.tiles as Array<Record<string, unknown>>) : null;
