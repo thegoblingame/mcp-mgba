@@ -974,6 +974,20 @@ const MENU_CMD_FREE: ReadonlySet<number> = new Set([
   MENU_CMD.give, MENU_CMD.trade, MENU_CMD.supply,
 ]);
 
+// The "shallow tier": commands whose entire flow is a single A on the menu entry —
+// no target selection and no sub-list to navigate. They are reachable purely by
+// locating the entry, which is now possible for all 27, so they are the cheapest
+// of the unimplemented commands to expose. What none of them has yet is a way to
+// PROVE it worked; see the handler in fe7Act for how that is handled honestly.
+const SHALLOW_CMD: Record<string, number> = {
+  visit:    MENU_CMD.visit,
+  door:     MENU_CMD.door,
+  chest:    MENU_CMD.chest,
+  ride:     MENU_CMD.ride,
+  dismount: MENU_CMD.dismount,
+  status:   MENU_CMD.status,
+};
+
 const MENU_PTRS_OFF = 0x2d;  // entry-pointer array, BELOW the index byte
 const ENTRY_CMD_OFF = 0x30;  // ROM command pointer inside an entry struct
 
@@ -1742,6 +1756,110 @@ async function fe7Act(
     };
   }
 
+  // ── Shallow-tier commands ────────────────────────────────────────────────
+  //
+  // Visit, Door, Chest, Ride, Dismount, Status: the six commands whose entire
+  // flow is "press A on the entry" — no target selection, no sub-list. The entry
+  // is located by its ROM pointer exactly as 'seize' is, so nothing is ever
+  // pressed that could not be named first.
+  //
+  // WHAT THIS DELIBERATELY DOES NOT DO IS CLAIM SUCCESS. No confirm-by-effect
+  // signal is known for any of them — which field proves a village was visited or
+  // a chest opened is simply not documented. So this reports the raw before/after
+  // delta of everything cheap to read and lets the caller judge, instead of
+  // inventing a verdict. Reporting "it worked" without a signal would be the same
+  // defect as the forecast printing stale bytes as data.
+  //
+  // It is also how the signals get learned: the first successful Visit shows which
+  // bytes move, and that goes in a note and then into RAM.md.
+  if (SHALLOW_CMD[action] !== undefined) {
+    const want = SHALLOW_CMD[action];
+    const label = action[0].toUpperCase() + action.slice(1);
+
+    const snap = async () => {
+      const b = await readRange(m, A.playerArray + slot * UNIT_STRIDE, 0x30);
+      const v = decodeUnit(b, 0, 0, A.playerArray);
+      const c = await phaseClock(m);
+      return {
+        x: v?.x, y: v?.y, hp: v?.hp,
+        flags: (v?.flags ?? 0) & 0xff,
+        items: v?.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",") ?? "",
+        turn: c.turn, phase: c.phase,
+        terrain: await terrainAt(m, destX, destY),
+      };
+    };
+    const before = await snap();
+
+    const menu = await locateMenu(m);
+    if (!menu) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Unit #${slot} reached (${destX},${destY}) but the action menu could not be located. Backed out; unit unspent.` };
+    }
+    const cmds = await menuEntryCmds(m, menu.addr, menu.count);
+    const shape = cmds.map(cmdName).join(", ");
+    const idx = cmds.indexOf(want);
+    if (idx < 0) {
+      await unwind(m, slot, startX, startY);
+      return {
+        text:
+          `No ${label} entry on unit #${slot}'s action menu at (${destX},${destY}) — the menu holds [${shape}]. ` +
+          `The game is not offering it here. Nothing was pressed; unit unspent at (${startX},${startY}).`,
+      };
+    }
+    if (!(await menuGoTo(m, menu.addr, idx, menu.count))) {
+      await unwind(m, slot, startX, startY);
+      return { text: `Found ${label} at index ${idx} of [${shape}] but could not move the highlight onto it. Nothing pressed; unit unspent.` };
+    }
+
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    const isFree = MENU_CMD_FREE.has(want);
+    if (isFree) {
+      // Marked as not consuming the turn, so waiting on the spent flag would just
+      // burn the timeout. Give the screen a moment and then look.
+      await sleep(1000);
+    } else {
+      await skipWhile(m, async () => {
+        const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
+        return c.turn !== before.turn || c.phase !== before.phase || !!v?.acted;
+      }, 20000);
+    }
+
+    const note = await readText(m);
+
+    // Return to a free cursor whatever happened. B closes a status screen, backs
+    // out of anything that did not commit, and is inert on a free map cursor.
+    let freed = await cursorResponds(m);
+    for (let i = 0; i < 3 && !freed; i++) {
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+      await sleep(280);
+      freed = await cursorResponds(m);
+    }
+
+    const after = await snap();
+    const chg: string[] = [];
+    if (after.x !== before.x || after.y !== before.y) chg.push(`position (${before.x},${before.y}) -> (${after.x},${after.y})`);
+    if (after.hp !== before.hp) chg.push(`HP ${before.hp} -> ${after.hp}`);
+    if (after.flags !== before.flags) chg.push(`+0x0C 0x${hex2(before.flags)} -> 0x${hex2(after.flags)}${(after.flags & 0x02) ? " (now SPENT)" : ""}`);
+    if (after.items !== before.items) chg.push(`inventory ${before.items || "-"} -> ${after.items || "-"}`);
+    if (after.turn !== before.turn) chg.push(`turn ${before.turn} -> ${after.turn}`);
+    if (after.phase !== before.phase) chg.push(`phase 0x${hex2(before.phase)} -> 0x${hex2(after.phase)}`);
+    if (after.terrain !== before.terrain) {
+      chg.push(`terrain at (${destX},${destY}) ${terrainName(before.terrain ?? -1)} -> ${terrainName(after.terrain ?? -1)}`);
+    }
+
+    return {
+      text:
+        `Unit #${slot}: ${label} found at index ${idx} of [${shape}] at (${destX},${destY}), highlighted and A pressed` +
+        (isFree ? ` (this command is flagged as NOT consuming the turn).` : `.`) + `\n` +
+        `  changed: ${chg.length ? chg.join("; ") : "NOTHING detectable in the unit record, the turn clock, or that tile's terrain"}\n` +
+        `  text buffer: ${JSON.stringify(note)}\n` +
+        `  cursor free afterwards: ${freed ? "yes" : "NO — something is still on screen, call fe7_unstick"}\n` +
+        `  NOTE: no confirm-by-effect signal is known for '${action}' yet, so this reports what changed and ` +
+        `does NOT claim the action succeeded. If it did work, the delta above IS the signal — record it with ` +
+        `fe7_note so it can go into RAM.md.`,
+    };
+  }
+
   if (action === "attack") {
     // Range comes from the WEAPONS THIS UNIT CAN ACTUALLY USE, not from an
     // assumption of melee. Hardcoding distance == 1 silently refused every hand
@@ -2165,7 +2283,11 @@ async function fe7Act(
     };
   }
 
-  return { text: `Unknown action "${action}". Use "wait", "attack", "staff" or "item".` };
+  return {
+    text:
+      `Unknown action "${action}". Verified actions: wait, attack, staff, item, seize. ` +
+      `Shallow-tier (selection verified, outcome UNVERIFIED): visit, door, chest, ride, dismount, status.`,
+  };
 }
 
 /**
@@ -3121,14 +3243,15 @@ export const FE7_TOOLS: Tool[] = [
         y: { type: "number", description: "Destination tile y." },
         action: {
           type: "string",
-          enum: ["wait", "attack", "staff", "item", "seize"],
+          enum: ["wait", "attack", "staff", "item", "seize", "visit", "door", "chest", "ride", "dismount", "status"],
           description:
             "'wait' ends the unit's turn on the destination tile, picked by wrapping the action menu UP to its last entry. That Up is MENU navigation, not a map input: it is verified by re-reading the cursor, because with no menu open it walks the map instead and the A behind it lands on the board. Commit is confirmed by the TURN CLOCK, not by the has-acted flag — if this is the last unspent unit its Wait ends the phase and the new turn clears that flag, which is success, not failure. " +
             "'attack' picks Attack and confirms against a target — pass target_slot to choose which enemy and have the choice VERIFIED before swinging. " +
             "'staff' heals with a staff: requires target_slot, and item_slot if the unit carries more than one staff. " +
             "'item' uses an item on the unit itself (a vulnerary); item_slot picks which, defaulting to the first. " +
             "'seize' takes a gate or throne with a lord, completing a Seize chapter. The Seize entry is located by READING the menu — each entry's struct carries a ROM pointer identifying its command — so it never presses A on an entry it cannot name. If no Seize entry exists it reports the whole menu's contents and backs out having pressed nothing. " +
-            "Only 'wait' can end the turn without an effect — every other action confirms it landed and reports what changed.",
+            "SHALLOW TIER — 'visit', 'door', 'chest', 'ride', 'dismount', 'status'. These six are located the same way Seize is, by reading the menu for their ROM command pointer, so nothing is pressed that could not be named first. They are NEW and their outcome is UNVERIFIED: no confirm-by-effect signal is known for any of them yet, so the tool presses A and then REPORTS the before/after delta of the unit record, the turn clock and the tile's terrain rather than claiming success. Read the delta and judge; if the action worked, that delta is the missing signal and is worth a fe7_note. Each backs out to a free cursor with B whatever happens. " +
+            "Only 'wait' can end the turn without an effect — the five verified actions confirm they landed and report what changed.",
         },
         target_slot: {
           type: "number",
