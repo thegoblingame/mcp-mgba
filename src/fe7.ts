@@ -49,7 +49,7 @@ const UI_ARENA_LEN = 8192;
 
 // ROM item table: entry = ITEM_TABLE + 0x24*id.
 //   +0x07 weapon type (0 sword 1 lance 2 axe 3 bow 4 staff 5 anima 6 light 7 dark, 9 consumable)
-//   +0x14 max uses, +0x15 Mt, +0x16 Hit, +0x17 Wt, +0x18 Crit, +0x19 range (hi nibble max, lo min)
+//   +0x14 max uses, +0x15 Mt, +0x16 Hit, +0x17 Wt, +0x18 Crit, +0x19 range (hi nibble MIN, lo nibble MAX)
 const ITEM_TABLE  = 0x08be222c;
 const ITEM_STRIDE = 0x24;
 const WTYPE_STAFF = 4;
@@ -139,6 +139,23 @@ async function readLayer(m: MgbaClient, slot: number, width: number, height: num
   return rowAddrs.map((a) => span.slice(a - lo, a - lo + width));
 }
 
+/**
+ * Terrain id of ONE tile. Three small reads, for the failure paths that want to
+ * name a tile without the cost of a whole-layer fetch.
+ *
+ * Same double indirection as readLayer: the slot holds the ROW-POINTER ARRAY,
+ * with the +2 top border already baked in, so index by y directly.
+ */
+async function terrainAt(m: MgbaClient, x: number, y: number): Promise<number | null> {
+  try {
+    const base = u32(await readRange(m, A.mapLayers + 4 * LAYER.terrain, 4), 0);
+    const row = u32(await readRange(m, base + 4 * y, 4), 0);
+    return (await readRange(m, row + x, 1))[0];
+  } catch {
+    return null;
+  }
+}
+
 async function fe7Terrain(m: MgbaClient, find: string): Promise<string> {
   const { width, height } = await readMapSize(m);
   const rows = await readLayer(m, LAYER.terrain, width, height);
@@ -217,11 +234,69 @@ async function waitUntil(probe: () => Promise<boolean>, timeoutMs: number, pollM
   }
 }
 
+/** How often to send the skip press while waiting on the game. */
+const SKIP_CADENCE_MS = 900;
+
+/**
+ * Wait for `done`, ALTERNATING Start and A to clear whatever is on screen.
+ *
+ * BOTH BUTTONS, because neither alone is known to cover every screen:
+ *
+ *   screen                              Start                      A
+ *   event cutscene (reinforcements)     skips whole sequence       one box at a time
+ *   death / battle quote (with the ▼)   skips it                   advances one box
+ *   level-up                            nothing                    nothing
+ *   free cursor, PLAYER phase           toggles the minimap        opens the FIELD MENU
+ *   free cursor, ENEMY phase            does NOT open the minimap  (map input ignored)
+ *
+ * A version of this pressed Start ONLY. On 2026-09-08 it sat through a five and a
+ * half minute enemy-phase freeze on Ch.22 turn 4 doing nothing, and a single A was
+ * what moved the game on. **The cause of that freeze is UNDETERMINED** — see
+ * llm_plays_fe7/runs/2026-09-08-stall/. Do not read it as "Start cannot clear a
+ * death quote": Grant has since confirmed by hand that Start does skip one. What
+ * it does establish is that Start-only was not sufficient in practice, and that a
+ * committed attack is the most likely way in the game to raise a quote box — so
+ * this alternates and covers both.
+ *
+ * A LEVEL-UP yields to no button and runs at its own pace, so callers pass a
+ * generous timeout rather than this pressing faster.
+ *
+ * Always ends with one B. On the PLAYER phase a late Start can leave the minimap
+ * up and a late A can open the field menu; B closes either, and on a free cursor
+ * with nothing open it does nothing at all. (Start does not open the minimap on the
+ * enemy phase, so that half of the risk is player-phase only.) The field menu is
+ * only dangerous when NAVIGATED — Suspend and End need an Up press to reach, and
+ * nothing here ever sends one.
+ */
+async function skipWhile(
+  m: MgbaClient,
+  done: () => Promise<boolean>,
+  timeoutMs: number,
+  cadenceMs = SKIP_CADENCE_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  let ok = false;
+  let i = 0;
+  for (;;) {
+    if (await done()) { ok = true; break; }
+    if (Date.now() >= deadline) break;
+    // Alternate. A first: after a committed action the likeliest blocker is a
+    // battle or death quote, and only A moves those.
+    await press(m, [{ buttons: [i++ % 2 === 0 ? "A" : "Start"], frames: 4, release_frames: 14 }]);
+    await sleep(cadenceMs);
+  }
+  await press(m, [{ buttons: ["B"], frames: 4, release_frames: 16 }]);
+  return ok;
+}
+
 // ── Unit decoding ──────────────────────────────────────────────────────────
 
 export interface Unit {
   slot: number;
   addr: number;
+  /** Character-struct pointer (+0x00). STABLE identity: array slots get recycled
+   *  by reinforcements, so a slot number alone does not identify a unit over time. */
+  charPtr: number;
   roster: number;
   classId: number;
   level: number;
@@ -259,6 +334,7 @@ function decodeUnit(b: number[], base: number, slot: number, arrayAddr: number):
   return {
     slot,
     addr: arrayAddr + slot * UNIT_STRIDE,
+    charPtr,
     roster: b[o + 0x0b],
     classId,
     level: b[o + 0x08],
@@ -419,10 +495,12 @@ async function readGrid(m: MgbaClient): Promise<Grid> {
   return { ...g, rows };
 }
 
-/** Just the shape, for callers that need bounds but not costs. */
-async function readGridGeometry(m: MgbaClient): Promise<GridGeom> {
-  return parseGridGeom(await readRange(m, A.gridTable, 8));
-}
+// readGridGeometry() lived here: the grid's shape without its costs. Both its
+// callers (fe7Inspect, fe7EndTurn) wanted MAP BOUNDS, and the grid is the wrong
+// source for those — its playable size is inferred, and it is only populated
+// while a unit is selected, which neither caller does. Both now read gBmMapSize.
+// If you need bounds again, use readMapSize(); the grid answers "where can THIS
+// unit go", never "how big is the map".
 
 /** The tile the grid marks cost 0 — i.e. who the game thinks is selected. */
 function gridOrigin(grid: Grid): { x: number; y: number } | null {
@@ -606,7 +684,23 @@ async function itemType(m: MgbaClient, id: number): Promise<number> {
 /** Min/max attack range of an item, from the ROM table's packed range nibbles. */
 async function itemRange(m: MgbaClient, id: number): Promise<{ min: number; max: number }> {
   const b = await readRange(m, ITEM_TABLE + ITEM_STRIDE * id + 0x19, 1);
-  return { min: b[0] & 0x0f, max: (b[0] >> 4) & 0x0f };
+  // HIGH nibble is MIN, LOW nibble is MAX. Reading them the other way round is
+  // not a cosmetic slip: every 1-2 weapon — hand axe, javelin, every tome —
+  // decodes to the empty interval 2-1, which no tile can satisfy, so the game
+  // is told "no enemy is in range" for a perfectly legal attack. Symmetric
+  // weapons (sword 0x11, bow 0x22) read the same both ways, which is how it
+  // survived. Verified against the live ROM: hand axe 0x28 = 0x12 -> 1-2,
+  // Lightning 0x3E = 0x12 -> 1-2, and the asymmetric ballista 0x34 = 0x3A ->
+  // 3-10, which is the case that settles the direction.
+  const min = (b[0] >> 4) & 0x0f, max = b[0] & 0x0f;
+  // Cheap invariant. An inverted range fails as "nothing in range" rather than
+  // as an error, which is exactly why the bug above went unnoticed for a week.
+  if (min > max) {
+    throw new Error(
+      `item 0x${hex2(id)} decodes to the empty range ${min}-${max} from range byte ` +
+      `0x${hex2(b[0])}. min > max can never match a tile — the nibbles are being read backwards.`);
+  }
+  return { min, max };
 }
 
 /** Inventory slot indices holding staves, in inventory order = the staff list's order. */
@@ -676,7 +770,60 @@ async function readForecast(m: MgbaClient): Promise<{ actor: BattleSide; target:
 /** Attack count for one side: uses(before) - uses(after). 2 means it doubles. */
 const blows = (s: BattleSide) => Math.max(0, s.usesBefore - s.usesAfter);
 
-function formatSide(label: string, s: BattleSide, oppDef: number): string {
+/**
+ * Is this side's forecast block real, or last battle's leftovers?
+ *
+ * The game populates a BattleUnit only for a side that actually FIGHTS, and it
+ * never clears the pair between battles. So when the defender cannot counter —
+ * a bow at range 1, an axe at range 2, no weapon at all — its half of the pair
+ * still holds whatever the previous fight left there, and it formats into a
+ * perfectly plausible-looking block. Observed live, twice: `dmg 0 x44 hit 255%
+ * crit 255%` and `dmg 2 x15 hit 255% crit 255%`, the second while the attacker
+ * finished on full HP because nothing had countered at all.
+ *
+ * That is the most dangerous thing this layer can do. A fabricated 255% crit
+ * reads as certain death and retreats a unit that was in no danger; a fabricated
+ * 0 damage reads as safety. Returns the reason it is not real, or null.
+ *
+ * Two independent tests, cheapest first:
+ *   1. Impossible values. Displayed hit and crit are percentages the game clamps
+ *      to 0-100, so 255 (0xFF) means "never written". No weapon in FE7 lands
+ *      more than 4 blows.
+ *   2. Reach. A side that cannot cover the combat distance did not swing. This
+ *      only became trustworthy once itemRange's nibbles were fixed — before that
+ *      every 1-2 weapon decoded to the empty interval and this test would have
+ *      called every hand-axe counter impossible.
+ */
+async function staleSideReason(
+  m: MgbaClient, s: BattleSide, distance: number | null,
+): Promise<string | null> {
+  if (s.effHit > 100 || s.effCrit > 100) {
+    return `its hit/crit read ${s.effHit}%/${s.effCrit}%, and a percentage above 100 means the field was never written (0xFF)`;
+  }
+  const n = blows(s);
+  if (n > 4) return `it claims ${n} blows, which no weapon in the game can do`;
+  if (n === 0) return `it lands no blows`;
+  if (distance !== null && s.weaponId) {
+    try {
+      const r = await itemRange(m, s.weaponId);
+      if (distance < r.min || distance > r.max) {
+        return `its weapon 0x${hex2(s.weaponId)} reaches ${r.min}-${r.max} and this fight is at range ${distance}`;
+      }
+    } catch {
+      // An undecodable weapon id is itself evidence the side is stale, but the
+      // value tests above are the ones that own that verdict.
+    }
+  }
+  return null;
+}
+
+function formatSide(label: string, s: BattleSide, oppDef: number, stale: string | null = null): string {
+  if (stale) {
+    return (
+      `${label}: NO ATTACK — ${stale}. Numbers withheld: this side's struct is not populated for ` +
+      `this fight, so what is in it belongs to an earlier battle. Treat it as absent, not as zero.`
+    );
+  }
   const dmg = Math.max(0, s.atk - oppDef);
   const n = blows(s);
   return (
@@ -773,13 +920,59 @@ async function locateMenu(m: MgbaClient): Promise<{ addr: number; count: number;
 // 0x08B956BC on both Lyn ch.1 and ch.7 — different arena slots, different menu
 // sizes. The EWRAM addresses are NOT stable and must never be hardcoded: slot
 // 0x0202547C held Attack on ch.7 and Wait on ch.1.
+//
+// THE WHOLE TABLE, all 27 of it. Base 0x08B95314, stride 0x24, terminated by an
+// all-zero 28th entry, and each entry's +0x09 is a sequential command id 0x4D..0x67.
+//
+// The names are not guesses. Each entry's +0x00 points at a SHIFT-JIS Japanese
+// developer name, left in the US ROM: 待機 (taiki, "standby") for Wait, 制圧
+// (seiatsu, "subjugate") for Seize, 攻撃 (kougeki) for Attack. Decoding all 27
+// reproduced every pointer this file already knew — seize, attack, item, trade,
+// wait — plus the two the run log had only guessed at from context, 0x08B954A0
+// ("Visit", found on a house tile) and 0x08B9559C ("Rescue", found beside an
+// ally). Seven for seven against independently-derived data.
+//
+// Entries 1 and 2 share a name and a name pointer but have different handlers;
+// the second is unidentified, and 'attack2' says so rather than inventing a
+// reason for it.
 const MENU_CMD = {
-  seize:  0x08b95314,
-  attack: 0x08b95338,
-  item:   0x08b9562c,
-  trade:  0x08b95650,
-  wait:   0x08b956bc,
+  seize:       0x08b95314, // 制圧
+  attack:      0x08b95338, // 攻撃
+  attack2:     0x08b9535c, // 攻撃 — same label, different handler; purpose unconfirmed
+  staff:       0x08b95380, // 杖
+  ride:        0x08b953a4, // 乗る    mount a ballista
+  dismount:    0x08b953c8, // 降りる
+  play:        0x08b953ec, // 奏でる  Nils
+  dance:       0x08b95410, // 踊る    Ninian
+  steal:       0x08b95434, // 盗む
+  talk:        0x08b95458, // 話す
+  support:     0x08b9547c, // 支援
+  visit:       0x08b954a0, // 訪問
+  chest:       0x08b954c4, // 宝箱
+  door:        0x08b954e8, // 扉
+  armory:      0x08b9550c, // 武器屋
+  vendor:      0x08b95530, // 道具屋
+  secretShop:  0x08b95554, // 秘密店
+  arena:       0x08b95578, // 闘技場
+  rescue:      0x08b9559c, // 救出
+  drop:        0x08b955c0, // 降ろす
+  take:        0x08b955e4, // 引受け
+  give:        0x08b95608, // 引渡し
+  item:        0x08b9562c, // 持ち物
+  trade:       0x08b95650, // 交換
+  supply:      0x08b95674, // 輸送隊  convoy access
+  status:      0x08b95698, // 状況
+  wait:        0x08b956bc, // 待機
 } as const;
+
+// Commands whose +0x08 byte is 0x04. Every one of them is an action FE7 lets a
+// unit take without ending its turn, and Trade — the one case this codebase had
+// already established behaves that way — is in the set. Treat it as a strong
+// hypothesis rather than a proven flag: it has not been tested on the other five.
+const MENU_CMD_FREE: ReadonlySet<number> = new Set([
+  MENU_CMD.ride, MENU_CMD.dismount, MENU_CMD.take,
+  MENU_CMD.give, MENU_CMD.trade, MENU_CMD.supply,
+]);
 
 const MENU_PTRS_OFF = 0x2d;  // entry-pointer array, BELOW the index byte
 const ENTRY_CMD_OFF = 0x30;  // ROM command pointer inside an entry struct
@@ -798,8 +991,11 @@ async function menuEntryCmds(m: MgbaClient, menuAddr: number, count: number): Pr
   return out;
 }
 
-const cmdName = (v: number) =>
-  (Object.entries(MENU_CMD).find(([, p]) => p === v)?.[0]) ?? `0x${v.toString(16)}`;
+const cmdName = (v: number) => {
+  const hit = Object.entries(MENU_CMD).find(([, p]) => p === v)?.[0];
+  if (!hit) return `0x${v.toString(16)}`;
+  return MENU_CMD_FREE.has(v) ? `${hit}*` : hit;
+};
 
 /** Move a menu highlight from its current index to `to`, wrapping downward. */
 async function menuGoTo(m: MgbaClient, menuAddr: number, to: number, count: number): Promise<boolean> {
@@ -922,7 +1118,7 @@ async function unwind(m: MgbaClient, slot: number, startX: number, startY: numbe
 }
 
 /**
- * Wait for an action to commit, pressing A to clear anything blocking it.
+ * Wait for an action to commit, alternating A and Start to clear anything blocking it.
  *
  * A LEVEL-UP screen blocks the spent flag: after a heal that levelled Lucius,
  * +0x0C stayed 0x01 and the staff uses stayed unchanged across consecutive reads
@@ -937,40 +1133,55 @@ async function phaseClock(m: MgbaClient): Promise<{ phase: number; turn: number 
 
 type Commit = { ok: boolean; via: "flag" | "phase"; turnBefore: number; turnAfter: number };
 
-// This polls has-acted AND presses A to clear dialogue (level-up, battle result,
-// item-use text) that would otherwise stall forever. Two hazards, both hit live:
+// This polls has-acted AND alternates A/Start to clear dialogue (battle result, item
+// -use text, event chatter) that would otherwise stall forever. A level-up is
+// NOT skippable by any button — it runs at its own pace — so the timeout, not
+// the cadence, is what carries that case. Two hazards, both hit live:
 //
 //  1. If this unit was the last unspent one, its action ends the player phase and
 //     the NEW TURN CLEARS has-acted. Polling the flag alone then reads "never
 //     committed" for an action that committed perfectly — and the loop keeps
-//     pressing A. At 420ms over a 12s item timeout that is ~28 blind A presses
-//     into a live map. Latch the turn clock and stop the moment it moves.
+//     pressing. At the old 420ms cadence over a 12s item timeout that was ~28
+//     blind presses into a live map. Latch the turn clock and stop the moment it
+//     moves. (The press is now Start, whose stray-press failure mode is the
+//     inert minimap rather than A's field menu, but stopping early still matters.)
 //  2. (WITHDRAWN — see below.) There is no text-based guard here any more.
 async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Promise<Commit> {
   const c0 = await phaseClock(m);
   const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
-    if (c.phase !== c0.phase || c.turn !== c0.turn) {
-      return { ok: true, via: "phase", turnBefore: c0.turn, turnAfter: c.turn };
-    }
-    if (v?.acted) return { ok: true, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
-    if (Date.now() >= deadline) return { ok: false, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
+  let tick = 0;
+  const run = async (): Promise<Commit> => {
+    for (;;) {
+      const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
+      if (c.phase !== c0.phase || c.turn !== c0.turn) {
+        return { ok: true, via: "phase", turnBefore: c0.turn, turnAfter: c.turn };
+      }
+      if (v?.acted) return { ok: true, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
+      if (Date.now() >= deadline) return { ok: false, via: "flag", turnBefore: c0.turn, turnAfter: c.turn };
+      // START, not A — see skipWhile() for why the difference is safety, not speed.
+      // Alternate A and Start — see skipWhile() for the measured table of which
+    // screen yields to which button. A alone misses cutscenes; Start alone misses
+    // battle and death quotes, which is the common case right after a commit.
     // NO "Discard." guard. It was added on a misreading and has been removed.
-    // The text buffer holds the LAST entry a menu RENDERED, not the highlighted
-    // one — confirmed on three menus: field menu -> "End.", action menu ->
-    // "Wait", item sub-menu -> "Discard.", each the bottom entry, and stepping
-    // the action menu's highlight six times never changed the string. So
-    // "Discard." means only "the item sub-menu is open", which is exactly where
-    // a legitimate item use also happens. Guarding on it would abort real uses
-    // while proving nothing about where the highlight actually sits.
-    //
-    // Knowing where the highlight is needs the menu's own index byte, which
-    // locateMenu()/menuGoTo() already read and verify. Any future guard belongs
-    // there, not on this string.
-    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 14 }]);
-    await sleep(420);
-  }
+      // The text buffer holds the LAST entry a menu RENDERED, not the highlighted
+      // one — confirmed on three menus: field menu -> "End.", action menu ->
+      // "Wait", item sub-menu -> "Discard.", each the bottom entry, and stepping
+      // the action menu's highlight six times never changed the string. So
+      // "Discard." means only "the item sub-menu is open", which is exactly where
+      // a legitimate item use also happens. Guarding on it would abort real uses
+      // while proving nothing about where the highlight actually sits.
+      //
+      // Knowing where the highlight is needs the menu's own index byte, which
+      // locateMenu()/menuGoTo() already read and verify. Any future guard belongs
+      // there, not on this string.
+      await press(m, [{ buttons: [tick++ % 2 === 0 ? "A" : "Start"], frames: 4, release_frames: 14 }]);
+      await sleep(SKIP_CADENCE_MS);
+    }
+  };
+  const out = await run();
+  // Close a minimap a late Start may have opened. Inert if nothing is open.
+  await press(m, [{ buttons: ["B"], frames: 4, release_frames: 16 }]);
+  return out;
 }
 
 // ── Run log ────────────────────────────────────────────────────────────────
@@ -1017,35 +1228,46 @@ async function fe7Note(kind: string, detail: string, wanted: string): Promise<st
 // ── Tool implementations ───────────────────────────────────────────────────
 
 /**
- * Read what the game says is on a tile, by parking the cursor there and reading
- * the on-screen text buffer.
+ * Ask the game's own renderer what is on ONE tile, by parking the cursor there
+ * and reading the on-screen text buffer.
  *
- * This exists because the terrain ARRAY is still unlocated, so there is no way to
- * ask "what is this tile" from memory directly. The cursor readout is the game's
- * own answer and it is a memory read, not a screenshot — but it is a rendering,
- * so it is reported raw rather than interpreted.
+ * NOT the way to map a board — fe7Terrain is. That reads the terrain array
+ * directly, returns every tile in three reads and moves no cursor, so it wins
+ * outright on "where is the gate", "which tiles are forts", "what is impassable".
+ * This tool walks the cursor to each tile and cannot beat the array at the
+ * array's own job. It was the only option before the array was located
+ * (2026-08-29); it is not any more.
  *
- * The buffer does NOT always hold a terrain name; it also carries objective text
- * and menu descriptions. So the caller gets the string verbatim plus the tile the
- * cursor actually reached, and can judge. Never claim a tile "is" something the
- * buffer did not say.
+ * What it still answers is what the GAME says, as opposed to what the array
+ * holds: the buffer carries objective and menu text the terrain array has no
+ * field for, and it is the cross-check when a terrain ID looks wrong.
+ *
+ * Its blind spot runs the other way. A unit standing on a tile MASKS the terrain
+ * in this readout, and the array does not suffer from that — so when the two
+ * disagree, suspect occupancy before suspecting a decode error.
+ *
+ * The buffer is a rendering, not a field, so it is reported raw. Never claim a
+ * tile "is" something the buffer did not say.
  */
 async function fe7Inspect(m: MgbaClient, tiles: Array<{ x: number; y: number }>): Promise<string> {
   const ps = await readRange(m, A.phase, 2);
   if (ps[0] !== 0x00) return `Phase is 0x${hex2(ps[0])}, not the player phase — the cursor is not free. Try again on the player phase.`;
 
-  const geom = await readGridGeometry(m);
-  const L: string[] = [`map ${geom.width}x${geom.height} (derived: ${geom.rowCount} rows x stride ${geom.stride})`];
+  // Bounds come from gBmMapSize, which states the map's real size outright.
+  // The movement grid used to supply them, and that was wrong twice over: its
+  // playable size is INFERRED from stride and row count, and it is only populated
+  // while a unit is selected — this tool never selects one, so it was reading
+  // whatever the last selection left behind. Same chapter that happens to agree;
+  // nothing had populated it for this call.
+  const { width, height } = await readMapSize(m);
+  const L: string[] = [`map ${width}x${height} (gBmMapSize)`];
 
   for (const t of tiles) {
-    if (t.x < 0 || t.y < 0 || t.x >= geom.stride || t.y >= geom.indexRows) {
-      L.push(`(${t.x},${t.y}) OFF-MAP — outside the grid entirely (stride ${geom.stride}, ${geom.indexRows} rows).`);
+    // A real size means a real refusal: no "beyond the inferred edge, trying
+    // anyway" hedge is needed now that the number is not a guess.
+    if (t.x < 0 || t.y < 0 || t.x >= width || t.y >= height) {
+      L.push(`(${t.x},${t.y}) OFF-MAP — this map is ${width}x${height}.`);
       continue;
-    }
-    if (t.x >= geom.width || t.y >= geom.height) {
-      // The playable size is inferred, so try anyway: a stalled cursor is a
-      // truthful answer, a false refusal is not.
-      L.push(`(${t.x},${t.y}) is beyond the INFERRED map edge (${geom.width}x${geom.height}) — trying anyway.`);
     }
     if (!(await moveCursorTo(m, t.x, t.y))) {
       const c = await readCursor(m);
@@ -1059,8 +1281,9 @@ async function fe7Inspect(m: MgbaClient, tiles: Array<{ x: number; y: number }>)
     L.push(`(${c.x},${c.y}) text: ${JSON.stringify(text)}`);
   }
 
-  L.push(`NOTE: this is the cursor readout, not a terrain array. It usually names the tile ` +
-    `("Plain."), but it also carries objective and menu text — read the raw string, do not assume.`);
+  L.push(`NOTE: this is the cursor readout, not the terrain array. It usually names the tile ` +
+    `("Plain."), but it also carries objective and menu text — read the raw string, do not assume. ` +
+    `A unit standing on a tile masks its terrain here; fe7_terrain reads the array and does not.`);
   return L.join("\n");
 }
 
@@ -1117,9 +1340,26 @@ async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
   // Green units block destinations exactly like allies do, and they fight the
   // enemy on their own during the green phase, so their positions and HP matter.
   if (npcs.length) {
-    L.push(`GREEN (allied NPCs — block tiles, act on the green phase):`);
+    // #N is the ARRAY SLOT, the same number fe7_act's target_slot expects with
+    // target_faction:'green', and the same one its refusal messages print. This
+    // used to render the roster byte as "g41" while fe7_act called the identical
+    // unit "#0", so healing the one NPC a chapter is about was a coin flip
+    // between two numbers with no way to tell which the parameter wanted.
+    L.push(`GREEN (allied NPCs — block tiles, act on the green phase; #N is the slot target_faction:'green' takes):`);
     for (const u of npcs) {
-      L.push(`  g${hex2(u.roster)} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}`);
+      // Same shape as players and enemies. Greens used to get a stats-free,
+      // items-free line, which on a protect chapter withheld exactly the facts
+      // the chapter turns on: the objective unit IS a green, so "how much damage
+      // does it survive" and "is it carrying a vulnerary" were unanswerable.
+      if (brief) {
+        L.push(`  #${u.slot} r${hex2(u.roster)} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}`);
+      } else {
+        const items = u.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",");
+        L.push(
+          `  #${u.slot} r${hex2(u.roster)} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
+          ` S${u.str} K${u.skl} P${u.spd} D${u.def} R${u.res} L${u.lck}` + (items ? ` [${items}]` : ""),
+        );
+      }
     }
   }
   return L.join("\n");
@@ -1134,6 +1374,18 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
   if (!u) return `No player unit in slot ${slot}.`;
   if (!u.deployed) return `Unit #${slot} is benched (x=0xFF).`;
   if (u.dead) return `Unit #${slot} is dead.`;
+  // PRE-FLIGHT, the same guard fe7_act has. Without it this pressed A on a spent
+  // unit, which is NOT a no-op: the game treats the tile as empty and opens the
+  // FIELD MENU (Unit/Status/Options/Suspend/End). The old code then reported
+  // "input swallowed" — a phrase that points at the emulator bridge and invites
+  // retrying — for a plain, permanent refusal, and left the menu open for the
+  // next call to trip over. This is the cheaper, scout-first tool, so it needs
+  // the guard more than fe7_act does, not less.
+  if (u.acted) {
+    return `Unit #${slot} has already acted this phase (+0x0C bit 1 set), and the game will not select a spent ` +
+      `unit — so there is no movement grid to read. Nothing was pressed. This is a permanent refusal until the ` +
+      `next turn, not blocked input and not something to retry.`;
+  }
 
   if (!u.selected) {
     if (!(await moveCursorTo(m, u.x, u.y))) return `Could not move cursor onto unit #${slot} at (${u.x},${u.y}) — input may be blocked.`;
@@ -1142,14 +1394,25 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
       const v = await readUnit(m, A.playerArray, slot);
       return !!v && v.selected;
     }, 1500);
-    if (!okSel) return `Pressed A on (${u.x},${u.y}) but unit #${slot} never became selected — input swallowed.`;
+    if (!okSel) {
+      // Always unwind. An A that did not select something opened SOMETHING, and
+      // returning without a B is what left a field menu standing and produced a
+      // second wrong diagnosis one call later.
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
+      return `Pressed A on (${u.x},${u.y}) but unit #${slot} never became selected. Pressed B to unwind, in case ` +
+        `the A opened the field menu rather than selecting. The unit reads unspent and alive, so if this repeats ` +
+        `call fe7_unstick — do not keep pressing.`;
+    }
   }
 
   const grid = await readGrid(m);
   const bad = gridMismatch(grid, u);
   if (bad) {
-    if (!keepSelected) await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
-    return bad;
+    // Always deselect on a FAILURE, even when keep_selected was asked for: there
+    // is nothing worth keeping selected, and leaving a unit selected is exactly
+    // what wedges the next call.
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
+    return `${bad} Deselected with B (keep_selected does not apply to a failed read).`;
   }
 
   const occMap = occupancy(
@@ -1192,7 +1455,9 @@ async function fe7Reachable(m: MgbaClient, slot: number, keepSelected: boolean):
       }
       L.push(`  ${String(y).padStart(2, " ")} ${row}`);
     }
-    L.push(`legend: digits = move cost (legal stop), U = ally, G = green NPC, E = enemy (all pass-through only), . = unreachable`);
+    L.push(`legend: digits = move cost and a LEGAL STOP | U = ally, G = green NPC — you may route THROUGH these ` +
+      `but not stop on them | E = enemy — enemies BLOCK pathing outright, so an enemy tile and anything only ` +
+      `reachable past it is unreachable, which is why those tiles read . rather than a cost | . = unreachable`);
   }
 
   if (!keepSelected) {
@@ -1267,11 +1532,6 @@ async function prologue(
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
     return { ok: false, text: `${bad} Move cancelled; unit #${slot} still at (${startX},${startY}) and unspent.` };
   }
-  const cost = gridCost(grid, destX, destY);
-  if (cost === UNREACHABLE) {
-    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
-    return { ok: false, text: `Destination (${destX},${destY}) is NOT reachable for unit #${slot} (grid = 0xFF: out of range, or blocked terrain). Move cancelled; unit still at (${startX},${startY}) and unspent.` };
-  }
   // Occupancy must cover ALL THREE factions. Green NPCs were the cause of a
   // whole class of "legal but refused" failures before they were included here:
   // they sit in the cost map as pass-through, exactly like allies.
@@ -1280,6 +1540,33 @@ async function prologue(
     { units: enemies, mark: "enemy" },
     { units: greens, mark: "green" },
   ).get(`${destX},${destY}`);
+
+  const cost = gridCost(grid, destX, destY);
+  if (cost === UNREACHABLE) {
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
+    // 0xFF has three quite different causes and the old message offered two
+    // guesses, neither of which was the truth when an enemy stood on the tile.
+    // Allies and greens are pass-through so their tiles carry a COST; only an
+    // enemy makes a tile read 0xFF, because enemies block pathing outright. The
+    // occupancy lookup was already computed one branch below — it just ran too
+    // late to be used here.
+    const t = await terrainAt(m, destX, destY);
+    const reach = Math.max(0, ...grid.rows.flat().filter((v) => v !== UNREACHABLE));
+    const why =
+      occ && occ.mark === "enemy"
+        ? `an ENEMY is standing there (slot #${occ.u.slot}, cls${hex2(occ.u.classId)}, HP ${occ.u.hp}/${occ.u.maxHp}). ` +
+          `Enemies BLOCK pathing in FE7, so that tile — and anything only reachable past it — reads 0xFF.`
+        : `nothing is standing on it. Terrain there is ${terrainName(t ?? -1)}` +
+          (t === null ? `` : ` (0x${hex2(t)})`) +
+          `, it is ${Math.abs(destX - startX) + Math.abs(destY - startY)} tiles away in a straight line, and this ` +
+          `unit's grid reaches cost ${reach} at most — so it is out of Move, or impassable for its movement class.`;
+    return {
+      ok: false,
+      text:
+        `Destination (${destX},${destY}) is NOT reachable for unit #${slot} — ${why} ` +
+        `Move cancelled; unit still at (${startX},${startY}) and unspent.`,
+    };
+  }
   if (occ) {
     await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
     return { ok: false, text: `Destination (${destX},${destY}) has cost ${cost} but is OCCUPIED by a ${occ.mark} unit (slot #${occ.u.slot}, cls${hex2(occ.u.classId)}, HP ${occ.u.hp}/${occ.u.maxHp}). The cost map allows routing through units but not stopping on them. Move cancelled.` };
@@ -1337,6 +1624,57 @@ async function fe7Act(
   itemSlot: number | null,
   targetFaction: string,
 ): Promise<ActResult> {
+  // PRE-FLIGHT. These refusals depend only on the unit's own record, so finding
+  // them out AFTER prologue() has already selected the unit and walked it to the
+  // destination costs a move and a planning cycle for nothing. One run spent a
+  // unit's turn discovering that a Monk cannot swing the Heal staff it carries.
+  // Nothing is pressed here — the unit does not move at all.
+  if (action === "staff") {
+    const pre = await readUnit(m, A.playerArray, slot);
+    if (pre) {
+      const where = `Nothing was moved or pressed; unit #${slot} is unspent at (${pre.x},${pre.y}).`;
+      if (targetSlot === null) {
+        return { text: `action="staff" needs target_slot — who to heal. ${where}` };
+      }
+      const preStaves = await staffSlots(m, pre);
+      if (preStaves.length === 0) {
+        return {
+          text: `Unit #${slot} carries no staff (inventory: ${pre.items.map((i) => hex2(i.id)).join(",") || "empty"}). ${where}`,
+        };
+      }
+      // Carrying a staff and being able to USE one are different facts, and only
+      // the second one matters: rank 0 means the class cannot use that type at
+      // all, so the game omits the Staff entry entirely.
+      if (pre.ranks[WTYPE_STAFF] === 0) {
+        return {
+          text:
+            `Unit #${slot} carries a staff (${preStaves.map((i) => hex2(pre.items[i].id)).join(",")}) but its STAFF RANK is 0 — ` +
+            `its class cannot use staves, so the game offers no Staff entry and it is only hauling one. ${where}`,
+        };
+      }
+    }
+  }
+
+  // Same argument for 'item' with no item_slot: whether the unit carries anything
+  // it can use on itself is a property of its inventory alone, so it is knowable
+  // before the unit takes a step. Only when no slot was named — an explicit slot
+  // may legitimately point at a key or a stat booster, which are not type 9.
+  if (action === "item" && itemSlot === null) {
+    const pre = await readUnit(m, A.playerArray, slot);
+    if (pre) {
+      let any = false;
+      for (const it of pre.items) if ((await itemType(m, it.id)) === 9) { any = true; break; }
+      if (!any) {
+        return {
+          text:
+            `Unit #${slot} carries no usable consumable — inventory is ` +
+            `${pre.items.map((i) => hex2(i.id)).join(",") || "empty"}, all weapons or staves. There is nothing to ` +
+            `'use' on itself. Nothing was moved or pressed; it is unspent at (${pre.x},${pre.y}).`,
+        };
+      }
+    }
+  }
+
   const pro = await prologue(m, slot, destX, destY);
   if (!pro.ok) return { text: pro.text };
   const { u, players, enemies, greens, cost, startX, startY } = pro;
@@ -1423,11 +1761,24 @@ async function fe7Act(
       return d >= minR && d <= maxR;
     });
     if (adj.length === 0) {
-      const committed = await commitWait(m, A.playerArray, slot);
+      // Back out; do NOT commit Wait. This used to fall through to commitWait and
+      // report "Waited instead.", which spent the unit's whole turn on an action
+      // the caller did not ask for and contradicted this tool's own documented
+      // contract ("cancels cleanly with B on any pre-commit failure"). It cost two
+      // units their turn in one chapter. Deciding to Wait is the caller's call.
+      // (The old line also always claimed "Waited instead." regardless: it tested
+      // commitWait's returned OBJECT for truthiness, which is never false.)
+      const restored = await unwind(m, slot, startX, startY);
       const why = maxR === 0
         ? `unit #${slot} has no usable weapon (inventory ${u.items.map((i) => hex2(i.id)).join(",") || "empty"})`
         : `no enemy is within its weapon range ${minR}-${maxR} of (${destX},${destY})`;
-      return { text: `Unit #${slot} moved to (${destX},${destY}) but Attack is unavailable — ${why}. ${committed ? "Waited instead." : "Wait also failed to commit."}` };
+      return {
+        text:
+          `Attack is unavailable — ${why}. Nothing was committed and NO Wait was issued: unit #${slot} is ` +
+          (restored
+            ? `UNSPENT and back at (${startX},${startY}), free to do something else this turn.`
+            : `unspent, but could not be fully unwound — check fe7_state before acting.`),
+      };
     }
     const before = adj.map((e) => ({ slot: e.slot, hp: e.hp }));
 
@@ -1470,9 +1821,15 @@ async function fe7Act(
           await press(m, Array.from({ length: targetCycle }, () => ({ buttons: ["Right"], frames: 4, release_frames: 12 })));
         }
         const f = await readForecast(m);
+        const tt = await battleTargetTile(m);
+        const dist = tt ? Math.abs(tt.x - destX) + Math.abs(tt.y - destY) : null;
+        const [aStale, dStale] = await Promise.all([
+          staleSideReason(m, f.actor, dist),
+          staleSideReason(m, f.target, dist),
+        ]);
         forecast =
-          `\n  forecast  ${formatSide("attacker", f.actor, f.target.def)}` +
-          `\n            ${formatSide("defender", f.target, f.actor.def)}`;
+          `\n  forecast  ${formatSide("attacker", f.actor, f.target.def, aStale)}` +
+          `\n            ${formatSide("defender", f.target, f.actor.def, dStale)}`;
       }
       // Stop pressing as soon as EITHER the unit is spent OR combat has visibly
       // started (any adjacent enemy's HP moved, or it died and left a hole).
@@ -1493,24 +1850,25 @@ async function fe7Act(
       if (started) break;
     }
 
-    // Combat resolves long after the last menu press. Wait it out WITHOUT
-    // pressing anything further.
-    await waitUntil(async () => {
-      const v = await readUnit(m, A.playerArray, slot);
-      return !!v && v.acted;
-    }, 25000, 150);
-
-    // Combat + animation can run long; wait on the unit becoming spent. As with
-    // Wait and Item, a unit that was the last unspent one ends the phase, and the
-    // new turn clears has-acted — so the turn clock, not the flag, is the truth.
-    // This path presses nothing while polling, so the old bug only mis-REPORTED.
+    // Combat, its animation, and whatever the game puts on screen afterwards: a
+    // boss pre-battle quote, a death quote, a weapon-broke box, a level-up.
+    //
+    // This used to press NOTHING for 45s and then report failure, which is how
+    // three separate run-log notes came to describe a COMPLETED KILL as "nothing
+    // happened" — the worst available shape of failure, because it invites
+    // re-issuing an action that already landed. Committing an attack is the most
+    // likely way in the whole game to trigger a dialogue box, so this is exactly
+    // the wait that needed to press through them.
+    //
+    // The turn clock, not the flag, remains the truth: a unit that was the last
+    // unspent one ends the phase, and the new turn clears has-acted.
     const clk0 = await phaseClock(m);
     let endedPhase = false;
-    const done = await waitUntil(async () => {
+    const done = await skipWhile(m, async () => {
       const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
       if (c.phase !== clk0.phase || c.turn !== clk0.turn) { endedPhase = true; return true; }
       return !!v && v.acted;
-    }, 20000, 100);
+    }, 45000);
 
     const after = await readArray(m, A.enemyArray);
     const self = await readUnit(m, A.playerArray, slot);
@@ -1520,13 +1878,22 @@ async function fe7Act(
         return now ? `#${b.slot} ${b.hp}->${now.hp}${now.hp === 0 ? " KILLED" : ""}` : `#${b.slot} gone`;
       })
       .join(", ");
+    // Read AFTER the wait, so this reflects the resolved fight rather than the
+    // pre-combat values a mid-animation read returns.
+    const landed = before.some((b) => {
+      const now = bySlot(after, b.slot);
+      return !now || now.hp !== b.hp;
+    });
     return {
       text: done
         ? `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp}, ` +
           (endedPhase
             ? `and it was the last unspent unit, so the player phase ended.${forecast}`
             : `+0x0C=0x${hex2((self?.flags ?? 0) & 0xff)}.${forecast}`)
-        : `Unit #${slot} moved to (${destX},${destY}) and Attack was chosen, but the unit never became spent within 20s. Enemy HP: ${deltas}. Something is still on screen.`,
+        : `Unit #${slot} moved to (${destX},${destY}) and Attack was chosen, but the has-acted flag never set within 45s. ` +
+          (landed
+            ? `The attack DID resolve — enemy HP changed: ${deltas}. This is a missing CONFIRMATION, not a missing action, so do NOT re-issue it: that would attack a second time. A level-up runs at its own pace and no button skips it. Call fe7_wait, then fe7_state to confirm.`
+            : `No enemy HP moved (${deltas}), so there is no evidence the attack resolved at all. Call fe7_unstick before retrying.`),
     };
   }
 
@@ -1551,6 +1918,8 @@ async function fe7Act(
   if (action === "staff" || action === "item") {
     const label = action === "staff" ? "Staff" : "Item";
 
+    // The three staff checks below are now a BACKSTOP: fe7Act pre-flights them
+    // before moving. They still run in case that pre-flight read came back null.
     if (action === "staff" && targetSlot === null) {
       await unwind(m, slot, startX, startY);
       return { text: `action="staff" needs target_slot (who to heal). Unit #${slot} left unspent at (${startX},${startY}).` };
@@ -1578,14 +1947,54 @@ async function fe7Act(
       return { text: `Unit #${slot} carries no items. Left unspent at (${startX},${startY}).` };
     }
 
+    // action='item' means "use this on yourself", and inventory slot 0 is almost
+    // always a WEAPON — a unit that carries one carries it first. Defaulting to 0
+    // meant the default tried to "use" an Iron Sword, and the resulting failure
+    // pointed nowhere near the real cause. Default to the first CONSUMABLE
+    // instead (weapon type 9), and name what the unit does carry when there is none.
+    const consumables: number[] = [];
+    if (action === "item") {
+      for (let i = 0; i < u.items.length; i++) {
+        if ((await itemType(m, u.items[i].id)) === 9) consumables.push(i);
+      }
+      if (itemSlot === null && consumables.length === 0) {
+        await unwind(m, slot, startX, startY);
+        return {
+          text:
+            `Unit #${slot} carries no usable consumable — inventory is ` +
+            `${u.items.map((i) => hex2(i.id)).join(",") || "empty"}, all weapons or staves. There is nothing to ` +
+            `'use' on itself. Left unspent at (${startX},${startY}).`,
+        };
+      }
+    }
+
     // Which entry of the sub-list we want: for a staff, the staff list holds only
     // type-4 items in inventory order, so an inventory slot has to be mapped into
     // that shorter list. For an item, list index == inventory slot exactly.
-    const wantInvSlot = itemSlot ?? (action === "staff" ? staves[0] : 0);
+    const wantInvSlot = itemSlot ?? (action === "staff" ? staves[0] : consumables[0]);
     const listIndex = action === "staff" ? Math.max(0, staves.indexOf(wantInvSlot)) : wantInvSlot;
-    if (action === "item" && wantInvSlot >= u.items.length) {
+    if (action === "item" && (wantInvSlot < 0 || wantInvSlot >= u.items.length)) {
       await unwind(m, slot, startX, startY);
       return { text: `item_slot ${wantInvSlot} is out of range — unit #${slot} carries ${u.items.length} item(s). Left unspent.` };
+    }
+    // An EXPLICIT item_slot pointing at a weapon or staff (types 0-7) is the same
+    // mistake made deliberately. Refuse it by name rather than driving the menus
+    // and failing somewhere less legible. Unknown types are allowed through —
+    // keys and stat boosters are not worth guessing wrong about.
+    if (action === "item" && itemSlot !== null) {
+      const t = await itemType(m, u.items[wantInvSlot].id);
+      if (t <= 7) {
+        await unwind(m, slot, startX, startY);
+        return {
+          text:
+            `item_slot ${wantInvSlot} holds 0x${hex2(u.items[wantInvSlot].id)}, a weapon or staff (type ${t}), not ` +
+            `something a unit can use on itself. ` +
+            (consumables.length
+              ? `Unit #${slot} does carry a consumable in slot ${consumables.join(" and ")}.`
+              : `Unit #${slot} carries no consumable at all.`) +
+            ` Nothing was pressed; left unspent at (${startX},${startY}).`,
+        };
+      }
     }
 
     const menu = await locateMenu(m);
@@ -1594,50 +2003,47 @@ async function fe7Act(
       return { text: `Unit #${slot} moved to (${destX},${destY}) but the action menu could not be located by diff. Left unspent — retry, or use action="wait".` };
     }
 
-    // DERIVE the entry index; do not scan for it. Scanning meant pressing A on
-    // entries that could not be identified in advance, and a bad guess is
-    // expensive: one run committed Wait and cost a unit its turn, another left two
-    // units sharing a tile. The order is fixed — Attack, Staff, Rescue, Item,
-    // Trade, ..., Wait — and the one entry we cannot predict (Rescue, which needs
-    // Con and Aid that the live struct does not expose) never moves either target:
-    //   Staff is 0, or 1 when Attack is present. Rescue sits BELOW it.
-    //   Item is counted from the BOTTOM — Wait last, Trade above it when present.
-    //   Rescue sits ABOVE Item.
-    let hasAttack = false;
-    for (const it of u.items) {
-      const t = await itemType(m, it.id);
-      if (t === WTYPE_STAFF || t === 9 || u.ranks[t] === 0) continue;
-      const rng = await itemRange(m, it.id);
-      if (enemies.some((e) => {
-        if (e.dead) return false;
-        const d = Math.abs(e.x - destX) + Math.abs(e.y - destY);
-        return d >= rng.min && d <= rng.max;
-      })) { hasAttack = true; break; }
-    }
-    const hasTrade = players.some(
-      (o) => o.slot !== slot && o.deployed && !o.dead &&
-             Math.abs(o.x - destX) + Math.abs(o.y - destY) === 1,
-    );
-
-    const wantIndex = action === "staff"
-      ? (hasAttack ? 1 : 0)
-      : menu.count - 2 - (hasTrade ? 1 : 0);
-
-    const shape = `menu count ${menu.count}, attack ${hasAttack ? "yes" : "no"}, trade ${hasTrade ? "yes" : "no"} -> index ${wantIndex}`;
-    if (wantIndex < 0 || wantIndex > menu.count - 2) {
+    // READ the entry index; do not derive it. This used to compute the index
+    // arithmetically from a model of the menu's fixed order — "Staff is 0, or 1
+    // when Attack is present", "Item is counted from the bottom, Wait last, Trade
+    // above it" — which meant reconstructing WHICH commands the game had decided to
+    // offer, from range checks and adjacency tests done on this side. Get any of
+    // those inputs wrong and the arithmetic lands on a different entry with total
+    // confidence; a 2026-09-01 run derived index 0 for a Monk's Staff and hit
+    // something else, spending a planning cycle to find out.
+    //
+    // None of that is necessary now that all 27 command pointers are known (see
+    // MENU_CMD). The menu already states its own contents: each entry struct
+    // carries the ROM pointer of its command, so the index is a lookup, not an
+    // inference. This is exactly what action='seize' has always done.
+    const cmds = await menuEntryCmds(m, menu.addr, menu.count);
+    const wantCmd = action === "staff" ? MENU_CMD.staff : MENU_CMD.item;
+    const wantIndex = cmds.indexOf(wantCmd);
+    const shape = `menu holds [${cmds.map(cmdName).join(", ")}]`;
+    if (wantIndex < 0) {
       await unwind(m, slot, startX, startY);
-      return { text: `Could not place ${label} in unit #${slot}'s action menu (${shape}). Refusing to guess — the last entry is Wait and pressing it would spend the turn. Unit unwound to (${startX},${startY}), unspent.` };
+      return {
+        text:
+          `No ${label} entry on unit #${slot}'s action menu at (${destX},${destY}) — ${shape}. ` +
+          `The game is not offering it here, so there is nothing to press. ` +
+          (action === "staff"
+            ? `A staff needs a healable target in range, and the unit's class must be able to use staves.`
+            : `Item needs something usable in the inventory.`) +
+          ` Nothing was pressed; unit unwound to (${startX},${startY}), unspent.`,
+      };
     }
     if (!(await menuGoTo(m, menu.addr, wantIndex, menu.count))) {
       await unwind(m, slot, startX, startY);
-      return { text: `Could not move unit #${slot}'s action-menu highlight to index ${wantIndex} (${shape}). Nothing pressed; unit unwound and unspent.` };
+      return { text: `Found ${label} at index ${wantIndex} of the ${shape} but could not move the highlight onto it. Nothing pressed; unit unwound and unspent.` };
     }
 
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
     await sleep(200);
 
-    // Rescue and Trade jump straight to a target selection where the NEXT A
-    // commits. If the derivation was wrong and we landed on one, stop here.
+    // BACKSTOP. The index came from the menu's own command pointers, so landing on
+    // Rescue or Trade should now be impossible — but both jump straight to a target
+    // selection where the NEXT A commits, so the check stays: it costs one read and
+    // it is the difference between a clean back-out and a wrong commit.
     const opened = await readText(m);
     if (/unit to rescue|unit to trade/i.test(opened)) {
       await unwind(m, slot, startX, startY);
@@ -1666,7 +2072,7 @@ async function fe7Act(
       // populated exactly there and nowhere else.
       if (await forecastLive(m)) {
         await unwind(m, slot, startX, startY);
-        return { text: `Index ${wantIndex} turned out to be Attack, not Item (${shape}) — the forecast went live. Backed out before committing; unit #${slot} unspent at (${startX},${startY}).` };
+        return { text: `Index ${wantIndex} turned out to be Attack, not Item (${shape}) — the forecast went live, which should be unreachable now the index is read from the menu rather than derived. Backed out before committing; unit #${slot} unspent at (${startX},${startY}).` };
       }
       const sub = await locateMenu(m);
       if (!sub || !(await menuGoTo(m, sub.addr, 0, sub.count))) {
@@ -1845,14 +2251,19 @@ async function fe7Forecast(
     const f = await readForecast(m);
     const t = await battleTargetTile(m);
     const foe = t ? enemies.find((e) => e.x === t.x && e.y === t.y) ?? null : null;
+    const dist = t ? Math.abs(t.x - destX) + Math.abs(t.y - destY) : null;
+    const [aStale, dStale] = await Promise.all([
+      staleSideReason(m, f.actor, dist),
+      staleSideReason(m, f.target, dist),
+    ]);
 
     const restored = await unwind(m, slot, startX, startY);
     const lines = [
       `Forecast — unit #${slot} cls${hex2(u.classId)} attacking from (${destX},${destY})` +
         (foe ? ` vs enemy #${foe.slot} cls${hex2(foe.classId)} at (${foe.x},${foe.y}) HP ${foe.hp}/${foe.maxHp}`
              : t ? ` vs the unit on (${t.x},${t.y}) (not matched to an enemy slot)` : ""),
-      `  ${formatSide("attacker", f.actor, f.target.def)}`,
-      `  ${formatSide("defender", f.target, f.actor.def)}`,
+      `  ${formatSide("attacker", f.actor, f.target.def, aStale)}`,
+      `  ${formatSide("defender", f.target, f.actor.def, dStale)}`,
       `  projected HP after: attacker ${f.actor.projHp}, defender ${f.target.projHp}` +
         `  <- a deterministic every-blow-lands projection, NOT a prediction; real combat rolls hit and crit`,
       restored
@@ -2063,6 +2474,21 @@ async function fe7Trade(
  * objective text says. It is deliberately not the thing state is inferred from,
  * because reading state off pixels is how you end up confidently wrong.
  */
+/** Strings that mean the CHAPTER itself has ended, win or lose. */
+const CHAPTER_END_RE = /we'?ve won|victory|game over|the enemy'?s fled|has fallen|retreat/i;
+
+/**
+ * Is the ASCII buffer showing prose — an event or dialogue — rather than a tile
+ * readout? Tile names are one short word ("Plain.", "Fort.", "Gate."); event text
+ * is a sentence. The buffer renders non-ASCII as '.', so strip those before
+ * counting. Deliberately a shape test, not a keyword list: it has to catch event
+ * text nobody has seen yet.
+ */
+function readoutLooksLikeProse(text: string): boolean {
+  const words = text.replace(/\./g, " ").trim().split(/\s+/).filter(Boolean);
+  return words.length >= 5 || words.join("").length >= 24;
+}
+
 async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }> {
   const L: string[] = [];
 
@@ -2084,7 +2510,8 @@ async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }
   // authority, which is why the verdict checks cursor movement first.
   L.push(`       forecast pair: ${fcLive ? "populated (may be stale from an earlier forecast — not proof a target selection is open)" : "never populated"}`);
   L.push(`       staff target proc: ${staffHit.count === 1 ? "PRESENT (a staff target selection is open)" : "absent"}`);
-  L.push(`       text buffer: ${JSON.stringify(await readText(m))}`);
+  const textBuf = await readText(m);
+  L.push(`       text buffer: ${JSON.stringify(textBuf)}`);
 
   // ── Input-signature probe ────────────────────────────────────────────────
   // Press away from the map edge so a blocked cursor is never mistaken for
@@ -2125,7 +2552,7 @@ async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }
   if (phase !== 0x00) {
     verdict = "NOT THE PLAYER PHASE";
     rec.push(`The game is on the ${PHASE_NAME[phase] ?? "unknown"} phase, so map input is ignored by design. Nothing is stuck.`);
-    rec.push(`Call fe7_wait — it polls the phase and presses A about once a second, which also clears death quotes and event text.`);
+    rec.push(`Call fe7_wait — it polls the phase and alternates A and Start about once a second: A advances a death quote, Start skips a cutscene whole, and neither is dangerous while the enemy phase owns input.`);
   } else if (cursorMoved) {
     verdict = `FREE CURSOR — input IS being accepted (${dir} moved it to (${curAfter.x},${curAfter.y}))`;
     rec.push(`The game is taking input normally, so whatever failed was not a dropped press.`);
@@ -2137,16 +2564,39 @@ async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }
   } else if (menuPair) {
     verdict = `MENU OPEN at 0x${menuPair.addr.toString(16).toUpperCase()} — ${menuPair.count} entries (the ${dir} press moved its index, not the cursor)`;
     rec.push(`Press B to close it. Do NOT press A to "see what happens": the last entry of a unit action menu is Wait, and in the field menu Suspend sits directly above End.`);
+  } else if (CHAPTER_END_RE.test(textBuf)) {
+    // The text buffer OUTRANKS the forecast gate. A run once got the confident
+    // verdict "POSSIBLY an attack target selection" while this same buffer read
+    // "....The enemy's fled......We've won!!!." — the chapter was over and the
+    // advice was to press B to back out of a cutscene. The decisive field was
+    // printed in the same output and simply never consulted.
+    verdict = `CHAPTER EVENT — the text buffer names an outcome, not a tile: ${JSON.stringify(textBuf)}`;
+    rec.push(`The chapter has ended or is ending. Press Start to advance the event; it is not stuck and there is nothing to back out of.`);
+    rec.push(`Confirm with fe7_state afterwards — a win moves to the next chapter, a loss leaves the phase byte stuck forever, which is why fe7_wait can never terminate on its own here.`);
+  } else if (readoutLooksLikeProse(textBuf)) {
+    // Same demotion, for ordinary event text. Verified live: cursor frozen on the
+    // player phase with the buffer reading "We'll serve as your reinforcements",
+    // which the old chain called a possible attack target selection. One Start
+    // press cleared it and freed the cursor.
+    // Prose covers two different screens and they take different buttons, so name
+    // both rather than guess. Dialogue ("We'll serve as your reinforcements")
+    // clears with Start; a unit INFO screen, whose buffer holds a class blurb like
+    // "Rogues and fortune-hunters. Possess..weak attack", closes with B. Both look
+    // identical from memory: cursor frozen, no menu index, prose in the buffer.
+    verdict = `EVENT, DIALOGUE OR INFO SCREEN — the cursor is frozen and the text buffer holds prose rather than a tile name: ${JSON.stringify(textBuf)}`;
+    rec.push(`If that string reads as SPEECH or narration, it is an event: press Start, which clears a whole sequence and cannot open the field menu if it lands late.`);
+    rec.push(`If it reads as a CLASS or ITEM description, it is an info/status screen instead: press B to close it. Start will not.`);
+    rec.push(`Either way this is why a tool can report "player phase" while input is still blocked — the phase byte flips before the event finishes.`);
   } else if (fcLive && changes.length > 0) {
-    // Reached only after the reliable checks have all missed, because a populated
-    // forecast is not by itself proof of anything — the game never clears it.
-    verdict = `POSSIBLY an attack target selection (cursor frozen, no menu index found, forecast populated — but that gate goes stale, so treat this as a guess)`;
+    // Reached only after every more reliable check has missed — including the two
+    // text-buffer branches above — because a populated forecast proves nothing on
+    // its own: the game never clears the pair.
+    verdict = `POSSIBLY an attack target selection (cursor frozen, no menu index found, no event text, forecast populated — but that gate goes stale, so treat this as a guess)`;
     rec.push(`Confirm with the screenshot before acting. If it IS target select, B backs out and A would COMMIT the attack.`);
-    rec.push(`If the screen shows a dialogue instead, press A to clear it.`);
   } else {
-    verdict = `INPUT SWALLOWED — ${dir} moved neither the cursor nor any menu index (${changes.length} bytes changed)`;
-    rec.push(`An event, dialogue box, level-up or animation is holding input. Press A repeatedly — that is exactly what dismisses it, and what fe7_wait does on a loop.`);
-    rec.push(`A level-up also blocks a unit's spent flag, so an action can look like it never landed when it is only waiting to be acknowledged.`);
+    verdict = `INPUT SWALLOWED — ${dir} moved neither the cursor nor any menu index (${changes.length} bytes changed), and the text buffer holds no event text`;
+    rec.push(`An event, animation or level-up is holding input. Press Start — it clears a whole dialogue sequence per press, and is what fe7_wait now does on a loop.`);
+    rec.push(`A LEVEL-UP is the exception: no button skips it, it runs at its own pace, and it blocks the unit's spent flag while it does — so an action can look like it never landed when it is only waiting to finish.`);
   }
 
   L.push("");
@@ -2162,7 +2612,17 @@ async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }
   let png: string | undefined;
   try {
     const path = await m.call<string>("screenshot", {});
-    png = (await readFile(path)).toString("base64");
+    const buf = await readFile(path);
+    png = buf.toString("base64");
+    // A mid-fade or blank frame compresses to almost nothing. Telling the caller
+    // to "confirm with the screenshot" when the screenshot is a black rectangle
+    // sends them to a dead end, so size it and say so.
+    L.push(
+      buf.length < 2000
+        ? `(screenshot is only ${buf.length} bytes — that is far too small for a real 240x160 frame, so it is ` +
+          `probably blank or mid-fade. Do NOT rely on it; the memory verdict above is the answer.)`
+        : `(screenshot ${buf.length} bytes)`,
+    );
     await unlink(path).catch(() => {});
   } catch (e) {
     L.push(`(screenshot unavailable: ${e instanceof Error ? e.message : String(e)})`);
@@ -2171,31 +2631,175 @@ async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }
 }
 
 /**
- * Wait for the player phase to return, pressing A periodically while it hasn't.
+ * Wait for the player phase to return, alternating A and Start while it hasn't.
  *
- * Pressing A is safe here and is the whole trick: during the enemy phase the
- * game ignores map input, so a stray A does nothing — but if a dialogue box is
- * up (a death quote, reinforcement chatter, a battle result) A is exactly what
- * dismisses it. That means we never have to classify WHICH event is on screen,
- * which matters because there is currently no reliable memory signal that
- * separates "dialogue is displayed" from "stale text sitting in the buffer".
- * A passive wait hangs forever on a death quote; this does not.
+ * ALTERNATES A and Start. Start clears an event cutscene (a reinforcement arrival)
+ * in a single press; A advances a dialogue box but only crawls through a cutscene
+ * one box at a time. Alternating covers both without having to classify which is on
+ * screen, which matters because there is no reliable memory signal separating
+ * "dialogue is displayed" from "stale text sitting in the buffer".
+ *
+ * A Start-only version of this sat through a five and a half minute enemy-phase
+ * freeze on 2026-09-08 and A was what moved the game on. **That freeze's cause is
+ * UNDETERMINED** and is open work — see llm_plays_fe7/runs/2026-09-08-stall/.
+ *
+ * Both are safe HERE specifically: during the enemy phase the game ignores map
+ * input, so neither press can select a unit or open the field menu. A passive wait
+ * hangs forever on a death quote; this does not.
+ *
+ * This deliberately does NOT try to make the enemy phase itself run faster. The
+ * only way to do that is to hold A down, and a held button during an unknown
+ * number of enemy actions is exactly the kind of blind input this layer exists
+ * to avoid. Slow and correct beats fast and occasionally catastrophic.
  */
-async function awaitPlayerPhase(m: MgbaClient, maxMs: number): Promise<{ returned: boolean; phase: number; turn: number }> {
+/**
+ * Does the map cursor actually respond to input right now?
+ *
+ * The one checkable test for "is anything holding input". Presses a direction
+ * chosen AWAY from the map edge — a blocked edge is not a blocked game — and
+ * puts the cursor straight back, so it is side-effect free on a live map.
+ */
+async function cursorResponds(m: MgbaClient): Promise<boolean> {
+  const c0 = await readCursor(m);
+  const dir = c0.y > 0 ? "Up" : "Down";
+  const back = dir === "Up" ? "Down" : "Up";
+  await press(m, [{ buttons: [dir], frames: 4, release_frames: 16 }]);
+  await sleep(220);
+  const c1 = await readCursor(m);
+  const moved = c1.x !== c0.x || c1.y !== c0.y;
+  if (moved) await press(m, [{ buttons: [back], frames: 4, release_frames: 16 }]);
+  return moved;
+}
+
+async function awaitPlayerPhase(
+  m: MgbaClient, maxMs: number,
+): Promise<{ returned: boolean; phase: number; turn: number; inputFree: boolean; cleared: number }> {
   const deadline = Date.now() + maxMs;
+  let beat = 0;
   for (;;) {
     const b = await readRange(m, A.phase, 2);
     if (b[0] === 0x00) {
-      // Stop pressing immediately. A press that races the phase flip could
-      // open the field menu or select a unit, so unwind with one B.
+      // THE PHASE BYTE FLIPS BEFORE THE TURN IS ACTUALLY YOURS. Observed live on
+      // Ch.22 turn 2: phase read 0x00 while a reinforcement cutscene ("We'll serve
+      // as your reinforcements") was still on screen swallowing every input. The
+      // old code tapped one B here and reported "player phase resumed", so the
+      // NEXT tool call walked into blocked input and produced a confusing failure
+      // of its own — the exact second-wrong-diagnosis shape the run log complains
+      // about elsewhere.
+      //
+      // B does not clear dialogue; Start does, a whole sequence per press (one
+      // press cleared that cutscene). So keep skipping until the cursor actually
+      // moves, which is the only checkable definition of "the turn is yours".
+      let cleared = 0;
+      let free = await cursorResponds(m);
+      while (!free && cleared < 8 && Date.now() < deadline) {
+        // Alternate here too: what is holding the turn open may be a cutscene
+        // (Start) or a lingering quote box (A). Every press is followed by the
+        // cursor test, so this stops the moment the map is actually yours.
+        await press(m, [{ buttons: [cleared % 2 === 0 ? "Start" : "A"], frames: 4, release_frames: 16 }]);
+        cleared++;
+        await sleep(700);
+        free = await cursorResponds(m);
+      }
+      // Trailing B as everywhere else: closes a minimap a late Start may have
+      // opened, and is inert on a free cursor.
       await press(m, [{ buttons: ["B"], frames: 4, release_frames: 14 }]);
       const c = await readRange(m, A.phase, 2);
-      return { returned: true, phase: c[0], turn: c[1] };
+      return { returned: true, phase: c[0], turn: c[1], inputFree: free, cleared };
     }
-    if (Date.now() >= deadline) return { returned: false, phase: b[0], turn: b[1] };
-    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 12 }]);
+    if (Date.now() >= deadline) {
+      // Same trailing B as everywhere else: closes a minimap a late Start opened.
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 14 }]);
+      return { returned: false, phase: b[0], turn: b[1], inputFree: false, cleared: 0 };
+    }
+    await press(m, [{ buttons: [beat++ % 2 === 0 ? "A" : "Start"], frames: 4, release_frames: 12 }]);
     await sleep(1100);
   }
+}
+
+// ── Enemy-phase attribution ────────────────────────────────────────────────
+//
+// The player phase is the only part of a turn you observe. Everything between
+// ending your turn and getting it back is invisible, and the summary that came
+// back afterwards was a bare head-count — so a unit could take 6 damage from
+// something you never identified, and the only way to guess was to diff classes
+// and positions by hand.
+//
+// Two signals make attribution possible without any new RAM research:
+//   • HP deltas say WHO was hurt.
+//   • WEAPON USES say who swung. An enemy that attacked has one fewer use on the
+//     weapon it used, which also names the weapon — that is how a staff-carrying
+//     enemy was eventually identified as the source of ranged damage.
+// Neither proves a pairing, so this reports the two lists side by side and says
+// so, rather than inventing an attacker for each wound.
+
+type Snap = {
+  turn: number;
+  units: Map<string, { id: number; x: number; y: number; hp: number; maxHp: number; cls: number; items: string }>;
+};
+
+let lastSnap: Snap | null = null;
+
+async function takeSnap(m: MgbaClient): Promise<Snap> {
+  const [c, players, enemies, greens] = await Promise.all([
+    phaseClock(m),
+    readArray(m, A.playerArray),
+    readArray(m, A.enemyArray),
+    readArray(m, A.greenArray),
+  ]);
+  const units = new Map<string, { id: number; x: number; y: number; hp: number; maxHp: number; cls: number; items: string }>();
+  const add = (tag: string, us: Unit[]) => {
+    for (const u of us) {
+      if (!u.deployed || u.dead) continue;
+      units.set(`${tag}${u.slot}`, {
+        id: u.charPtr,
+        x: u.x, y: u.y, hp: u.hp, maxHp: u.maxHp, cls: u.classId,
+        items: u.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(","),
+      });
+    }
+  };
+  add("P", players); add("E", enemies); add("G", greens);
+  return { turn: c.turn, units };
+}
+
+/** What changed between two snapshots, as facts rather than a story. */
+function diffSnap(before: Snap, after: Snap): string {
+  const hurt: string[] = [], gone: string[] = [], swung: string[] = [], reused: string[] = [];
+  for (const [k, b] of before.units) {
+    const a = after.units.get(k);
+    const side = k[0] === "P" ? "player" : k[0] === "E" ? "enemy" : "green";
+    const id = `${side} #${k.slice(1)} cls${hex2(b.cls)}`;
+    if (!a) { gone.push(`${id} DIED`); continue; }
+    // SLOT REUSE. Array slots are recycled: a unit dies, a reinforcement takes its
+    // index, and comparing the two by slot number produces fiction — an enemy that
+    // "healed 22 HP", or an inventory that "changed" into something unrelated.
+    // The character pointer is the identity that survives, so anything whose id
+    // moved is reported as a substitution, never as a delta.
+    if (a.id !== b.id) {
+      reused.push(`${side} #${k.slice(1)} is now a DIFFERENT unit (was cls${hex2(b.cls)}, now cls${hex2(a.cls)}) — the slot was recycled`);
+      continue;
+    }
+    if (a.hp !== b.hp) hurt.push(`${id} ${b.hp}->${a.hp} (${a.hp > b.hp ? "+" : ""}${a.hp - b.hp})`);
+    if (a.items !== b.items) swung.push(`${id} inventory ${b.items || "-"} -> ${a.items || "-"}`);
+  }
+  // Slots present now that were not before: reinforcements.
+  const arrived: string[] = [];
+  for (const [k, a] of after.units) {
+    if (!before.units.has(k)) {
+      const side = k[0] === "P" ? "player" : k[0] === "E" ? "enemy" : "green";
+      arrived.push(`${side} #${k.slice(1)} cls${hex2(a.cls)} at (${a.x},${a.y}) HP ${a.hp}/${a.maxHp}`);
+    }
+  }
+  const L: string[] = [];
+  if (gone.length) L.push(`  died:     ${gone.join("; ")}`);
+  if (hurt.length) L.push(`  HP:       ${hurt.join("; ")}`);
+  if (swung.length) L.push(`  used:     ${swung.join("; ")}`);
+  if (arrived.length) L.push(`  ARRIVED:  ${arrived.join("; ")}`);
+  if (reused.length) L.push(`  RECYCLED: ${reused.join("; ")}`);
+  if (!L.length) return `  nothing changed on the board.`;
+  L.push(`  (A dropped weapon use means that unit ACTED and names the weapon it used. HP changes and uses are ` +
+    `listed separately on purpose — neither proves which attacker caused which wound.)`);
+  return L.join("\n");
 }
 
 /** Who is left standing, and who fell. Dead units stay dead, so this needs no baseline. */
@@ -2217,22 +2821,111 @@ async function battlefieldSummary(m: MgbaClient): Promise<string> {
   );
 }
 
+/**
+ * A cheap fingerprint of everything a running enemy phase ought to be changing.
+ * If this is byte-identical across a whole wait window, the phase is not slow —
+ * it is not running.
+ */
+async function boardFingerprint(m: MgbaClient): Promise<string> {
+  const [c, players, enemies, greens] = await Promise.all([
+    phaseClock(m),
+    readArray(m, A.playerArray),
+    readArray(m, A.enemyArray),
+    readArray(m, A.greenArray),
+  ]);
+  const f = (us: Unit[]) =>
+    us.filter((u) => u.deployed && !u.dead).map((u) => `${u.slot}@${u.x},${u.y}:${u.hp}`).join("|");
+  return `${c.phase}/${c.turn}//${f(players)}//${f(enemies)}//${f(greens)}`;
+}
+
+/**
+ * Losing states this layer can PROVE from data it already reads.
+ *
+ * A run once spent 4.5 minutes calling fe7_wait three times over a chapter that
+ * had already ended, with the tool cheerfully advising another wait each time —
+ * while its own output said "FALLEN: #9" and then "green 0". The phase byte
+ * stays 0x80 forever once the game is over, so phase polling alone can NEVER
+ * terminate; something has to notice.
+ *
+ * DELIBERATELY NOT GUESSED: the game's own GAME OVER flag. Its address is not in
+ * RAM.md, and inventing one would be exactly the kind of plausible-looking wrong
+ * answer this layer exists to avoid. These are inferred signals, and they say so.
+ */
+async function lossSignal(m: MgbaClient, greensBefore: number): Promise<string | null> {
+  const [players, greens] = await Promise.all([
+    readArray(m, A.playerArray),
+    readArray(m, A.greenArray),
+  ]);
+  const deployed = players.filter((p) => p.deployed);
+  const alive = deployed.filter((p) => !p.dead);
+  if (deployed.length > 0 && alive.length === 0) {
+    return `every deployed player unit is dead (${deployed.length} deployed, 0 alive)`;
+  }
+  const greensNow = greens.filter((g) => g.deployed && !g.dead).length;
+  if (greensBefore > 0 && greensNow === 0) {
+    return `the green NPCs went from ${greensBefore} to 0 during this wait — and on a chapter whose objective ` +
+      `is to protect one, that IS the loss condition`;
+  }
+  return null;
+}
+
 async function fe7Wait(m: MgbaClient, timeoutMs: number): Promise<string> {
   const pre = await readRange(m, A.phase, 2);
   if (pre[0] === 0x00) return `Already the player phase (turn ${pre[1]}).\n${await battlefieldSummary(m)}`;
 
+  const greensBefore = (await readArray(m, A.greenArray)).filter((g) => g.deployed && !g.dead).length;
+  const fpBefore = await boardFingerprint(m);
+  // Baseline for attribution. fe7_end_turn normally sets this from the last
+  // player phase; if fe7_wait was called cold, this call's start is the best
+  // baseline available and is still better than none.
+  const base = lastSnap ?? (await takeSnap(m));
+
   const r = await awaitPlayerPhase(m, timeoutMs);
   const summary = await battlefieldSummary(m);
-  return r.returned
-    ? `Player phase resumed on turn ${r.turn}.\n${summary}`
-    : `Still ${PHASE_NAME[r.phase] ?? `0x${hex2(r.phase)}`} phase after ${Math.round(timeoutMs / 1000)}s (turn ${r.turn}). ` +
-      `A was pressed throughout, so a dialogue box is not what's holding it. Call fe7_wait again to keep waiting.\n${summary}`;
+  if (r.returned) {
+    const how = r.cleared ? ` (cleared ${r.cleared} event sequence${r.cleared === 1 ? "" : "s"} with Start)` : "";
+    const now = await takeSnap(m);
+    const changes = `\nWHAT HAPPENED WHILE YOU WERE NOT LOOKING (turn ${base.turn} -> ${now.turn}):\n${diffSnap(base, now)}`;
+    lastSnap = now;
+    return r.inputFree
+      ? `Player phase resumed on turn ${r.turn}${how}; the cursor responds, so the turn is genuinely yours.\n${summary}${changes}`
+      : `Player phase resumed on turn ${r.turn}${how}, BUT THE CURSOR STILL DOES NOT RESPOND — something is on ` +
+        `screen that Start did not clear in ${r.cleared} presses. Do not issue unit actions yet: they would be ` +
+        `swallowed and reported as failures. Call fe7_unstick to see what is up.\n${summary}${changes}`;
+  }
+
+  const secs = Math.round(timeoutMs / 1000);
+  const loss = await lossSignal(m, greensBefore);
+  if (loss) {
+    return (
+      `CHAPTER PROBABLY LOST — ${loss}.\n` +
+      `STOP WAITING. The phase byte stays 0x${hex2(r.phase)} once the game is over, so calling fe7_wait again ` +
+      `will poll forever. Call fe7_unstick and read its screenshot to confirm a GAME OVER screen.\n` +
+      `(This is INFERRED from the unit arrays — the game's own game-over flag is not located in RAM.md yet, ` +
+      `so treat it as a strong signal, not proof.)\n${summary}`
+    );
+  }
+
+  const frozen = (await boardFingerprint(m)) === fpBefore;
+  return (
+    `Still ${PHASE_NAME[r.phase] ?? `0x${hex2(r.phase)}`} phase after ${secs}s (turn ${r.turn}). ` +
+    (frozen
+      ? `NOTHING ON THE BOARD CHANGED in that time — not one unit moved and no HP changed. A running enemy phase ` +
+        `always moves something, so this is not slowness. Call fe7_unstick before waiting again: the likely causes ` +
+        `are a finished chapter, or an event this tool's Start presses cannot clear.`
+      : `Units did move, so the enemy phase IS running and just needs longer — call fe7_wait again.`) +
+    `\n${summary}`
+  );
 }
 
 async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
   const phaseB = await readRange(m, A.phase, 2);
   if (phaseB[0] !== 0x00) return `Not the player phase (0x${hex2(phaseB[0])}) — nothing to end.`;
   const startTurn = phaseB[1];
+  // The baseline for "what happened during the phase you could not watch".
+  // Taken here, while the board is still yours and nothing has moved.
+  lastSnap = await takeSnap(m);
+  const baseSnap = lastSnap;
 
   // The field menu only opens on an EMPTY tile; on a unit, A selects it instead.
   const players = await readArray(m, A.playerArray);
@@ -2246,14 +2939,19 @@ async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
     ).keys(),
   );
 
-  const geom = await readGridGeometry(m);
+  // gBmMapSize, not the movement grid. This runs with NO unit selected — that is
+  // the whole point, the field menu only opens on empty ground — so the grid holds
+  // whatever the previous selection left in IWRAM. End the turn without moving
+  // anyone on a fresh chapter and that is the PREVIOUS chapter's geometry, which
+  // would bound this search to the wrong rectangle and hunt for a tile off the map.
+  const { width, height } = await readMapSize(m);
   const cur = await readCursor(m);
   let spot: { x: number; y: number } | null = null;
   for (let r = 0; r < 12 && !spot; r++) {
     for (let dy = -r; dy <= r && !spot; dy++) {
       for (let dx = -r; dx <= r && !spot; dx++) {
         const x = cur.x + dx, y = cur.y + dy;
-        if (x < 0 || y < 0 || x >= geom.width || y >= geom.height) continue;
+        if (x < 0 || y < 0 || x >= width || y >= height) continue;
         if (!taken.has(`${x},${y}`)) spot = { x, y };
       }
     }
@@ -2311,12 +3009,15 @@ async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
   const summary = await battlefieldSummary(m);
 
   if (r.returned) {
-    return `Turn ${startTurn} -> ${r.turn}, player phase already back.\n${summary}`;
+    const now = await takeSnap(m);
+    const changes = `\nWHAT HAPPENED WHILE YOU WERE NOT LOOKING:\n${diffSnap(baseSnap, now)}`;
+    lastSnap = now;
+    return `Turn ${startTurn} -> ${r.turn}, player phase already back.\n${summary}${changes}`;
   }
   return (
     `Turn ended (phase is now ${PHASE_NAME[r.phase] ?? `0x${hex2(r.phase)}`}); the enemy phase is still running after ` +
     `${Math.round(timeoutMs / 1000)}s. This is normal on a big map — call fe7_wait to continue waiting in ` +
-    `resumable chunks (it keeps pressing A, so death quotes and event text won't stall it).\n${summary}`
+    `resumable chunks (it alternates A and Start, so death quotes and event cutscenes both clear).\n${summary}`
   );
 }
 
@@ -2329,7 +3030,7 @@ export const FE7_TOOLS: Tool[] = [
       "PURPOSE: Read and DECODE the full Fire Emblem 7 battlefield in one call — turn, phase, cursor, and every player and enemy unit with position, HP, stats, items and has-acted status. " +
       "USAGE: Call this instead of dumping the unit arrays with mgba_read_range and decoding 72-byte structs by hand; it replaces ~5KB of hex per turn. Use `brief` for a positions-and-HP-only view when planning movement, and the full view when you need stats to predict combat. " +
       "BEHAVIOR: Pure read, no side effects and no input. Units are decoded from the player array at 0x0202BD50 and the enemy array at 0x0202CEC0, stopping at the first empty slot. Benched units (x=0xFF) and dead units (current HP 0) are excluded from the listings and summarised as counts. " +
-      "RETURNS: A header line with turn/phase/cursor, then PLAYERS and ENEMIES sections, one line per unit. US release only (AGB-AE7E).",
+      "RETURNS: A header line with turn/phase/cursor, then PLAYERS, ENEMIES and GREEN sections, one line per unit. Every line starts with #N, the ARRAY SLOT — the same number fe7_act's slot and target_slot take, greens included. Green lines also carry rN, the roster byte, which is NOT what any parameter wants. US release only (AGB-AE7E).",
     inputSchema: {
       type: "object",
       properties: {
@@ -2361,11 +3062,11 @@ export const FE7_TOOLS: Tool[] = [
   {
     name: "fe7_inspect",
     description:
-      "PURPOSE: Ask the game what is on a tile — terrain name, village, gate — by moving the cursor there and reading its on-screen readout out of memory. " +
-      "USAGE: This is the ONLY way to identify a tile today: the terrain array is not located, so nothing can map the board. Use it to find a Seize gate, a village, or to check whether a tile is defensive terrain before parking a unit on it. Pass `tiles` to inspect several in one call; each one costs a cursor walk, so ask about candidates rather than sweeping a whole map. " +
-      "BEHAVIOR: Drives input, but only the D-pad — it moves the cursor and reads, never presses A or B, so it cannot select, commit or change anything. Refuses unless the player phase is active, since the cursor is not free otherwise. Tiles outside the real map (derived per chapter from the row-pointer table) are reported OFF-MAP rather than walked to. " +
-      "RETURNS: The map's derived dimensions, then one line per tile with the tile the cursor ACTUALLY reached and the readout string verbatim. " +
-      "IMPORTANT: the buffer is a rendering, not a terrain array — it usually holds the tile name (\"Plain.\") but also carries objective and menu text. Report the raw string; never assert a tile 'is' something the readout did not say.",
+      "PURPOSE: Ask the game's own renderer what is on ONE tile, by moving the cursor there and reading its on-screen readout out of memory. " +
+      "USAGE: Reach for fe7_terrain FIRST. That reads the terrain array directly, returns the WHOLE board in three reads and moves no cursor, so it is how you find the gate, the villages, the forts and the impassable tiles — this tool cannot beat it at that and costs a cursor walk per tile. Use this one only for what the array cannot answer: cross-checking a terrain ID you do not trust, or reading the objective and menu text the array has no field for. Pass `tiles` to ask about several candidates in one call; never sweep a map with it. " +
+      "BEHAVIOR: Drives input, but only the D-pad — it moves the cursor and reads, never presses A or B, so it cannot select, commit or change anything. Refuses unless the player phase is active, since the cursor is not free otherwise. Bounds come from gBmMapSize, the game's own stated map size, so a tile outside the map is reported OFF-MAP rather than walked to. " +
+      "RETURNS: The map's real dimensions, then one line per tile with the tile the cursor ACTUALLY reached and the readout string verbatim. " +
+      "IMPORTANT: the buffer is a rendering, not the terrain array — it usually holds the tile name (\"Plain.\") but also carries objective and menu text. Report the raw string; never assert a tile 'is' something the readout did not say. A unit standing on a tile MASKS its terrain in this readout; fe7_terrain reads the array and does not, so when the two disagree suspect occupancy before a decode error.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2390,7 +3091,9 @@ export const FE7_TOOLS: Tool[] = [
       "USAGE: Call this BEFORE fe7_act when you are unsure a destination is in range — it answers 'can this unit reach that tile' for every tile at once, already accounting for terrain cost, class and blocking units. " +
       "BEHAVIOR: Drives input — it moves the cursor onto the unit and presses A to select (which is what populates the grid), then presses B to deselect unless `keep_selected` is set. Every step is verified against memory. The grid's geometry is DERIVED PER CHAPTER from the game's own row-pointer table (row count and stride are sized to the map and differ per chapter — never hardcoded), and the decode is asserted by requiring the cost-0 tile to equal the selected unit's position, so a misread fails loudly instead of returning a plausible wrong map. " +
       "IMPORTANT: the underlying grid is a PATHFINDING COST map and includes tiles occupied by other units — you may route through allies but not stop on them. This tool marks those tiles 'U'/'E' so legal destinations are only the numeric ones. " +
-      "RETURNS: A cost grid (digits = move cost and a legal stop, U = ally, E = enemy, . = unreachable), the unit's Move, and a count of legal destinations.",
+      "RETURNS: A cost grid (digits = move cost and a legal stop, U = ally, G = green NPC, E = enemy, . = unreachable), the unit's Move, and a count of legal destinations. " +
+      "Allies and greens are pass-through — you may route through them but not stop on them. ENEMIES ARE NOT: they block pathing outright, so an enemy tile, and anything only reachable past it, is genuinely unreachable. " +
+      "Refuses up front if the unit has already acted, since the game will not select a spent unit and there would be no grid to read — that is a permanent refusal until next turn, not blocked input.",
     inputSchema: {
       type: "object",
       properties: {
@@ -2408,7 +3111,7 @@ export const FE7_TOOLS: Tool[] = [
     description:
       "PURPOSE: Perform one unit's entire turn — select it, walk it to a destination, and commit an action — verifying every step against memory. " +
       "USAGE: This is the main tool for playing. It replaces a fragile ~12-press blind sequence that silently loses inputs during walk animations and menu transitions. Prefer it over driving mgba_press_sequence yourself. " +
-      "BEHAVIOR: Drives input. Refuses to act unless the phase byte is 0x00 (player phase) and the unit is deployed, alive and unspent. VALIDATES THE DESTINATION AGAINST THE GAME'S COST MAP BEFORE PRESSING ANYTHING, and refuses with a specific reason if the tile is unreachable (0xFF) or occupied — so a failure tells you WHICH condition failed instead of a silent no-op. Cursor movement, selection, the completed walk and the committed action are each confirmed by reading memory, with retries; a move that fails despite a legal destination is reported explicitly as a dropped input. Cancels cleanly with B on any pre-commit failure, leaving the unit unspent. " +
+      "BEHAVIOR: Drives input. Refuses to act unless the phase byte is 0x00 (player phase) and the unit is deployed, alive and unspent. VALIDATES THE DESTINATION AGAINST THE GAME'S COST MAP BEFORE PRESSING ANYTHING, and refuses with a specific reason if the tile is unreachable (0xFF) or occupied — naming the enemy standing on it, or the terrain plus how far this unit's Move actually reaches, instead of guessing between causes. Capability refusals that depend only on the unit's own record (no staff, staff rank 0, no consumable) are made BEFORE it moves, so a doomed action costs no ground. Cursor movement, selection, the completed walk and the committed action are each confirmed by reading memory, with retries; a move that fails despite a legal destination is reported explicitly as a dropped input. Cancels cleanly with B on any pre-commit failure, leaving the unit UNSPENT — in particular a refused attack backs out and never substitutes a Wait, so the unit is still free to do something else. While waiting for a committed action to resolve it alternates A and Start: a boss or death quote advances only on A, an event cutscene skips whole on Start, and a level-up yields to neither and is carried by a generous timeout instead. " +
       "RETURNS: A one-line summary of the move and its outcome; for attacks, the before/after HP of every adjacent enemy plus the attacker's own HP.",
     inputSchema: {
       type: "object",
@@ -2435,11 +3138,11 @@ export const FE7_TOOLS: Tool[] = [
         target_faction: {
           type: "string",
           enum: ["player", "green"],
-          description: "Which array target_slot indexes for action='staff'. Defaults to 'player'. Green NPCs are valid staff targets.",
+          description: "Which array target_slot indexes for action='staff'. Defaults to 'player'. Green NPCs are valid staff targets — pass the slot fe7_state prints for them, the #N at the start of each GREEN line (NOT the rN roster byte on the same line).",
         },
         item_slot: {
           type: "number",
-          description: "Inventory slot (0-based, as listed by fe7_state) of the staff or item to use. Defaults to the first staff for 'staff' and slot 0 for 'item'.",
+          description: "Inventory slot (0-based, as listed by fe7_state) of the staff or item to use. Defaults to the first staff for 'staff', and for 'item' to the first CONSUMABLE the unit carries — not slot 0, which is almost always a weapon. A slot holding a weapon or staff is refused by name rather than attempted.",
         },
         target_cycle: {
           type: "number",
@@ -2455,7 +3158,8 @@ export const FE7_TOOLS: Tool[] = [
       "PURPOSE: Read Fire Emblem 7's combat forecast — both sides' damage, number of blows, hit%, crit%, AS and avoid — for an attack you have NOT committed to yet. " +
       "USAGE: Call this before fe7_act(action='attack') whenever the trade matters: a wounded unit, a possible kill, or a choice between targets. Pass the destination tile you would attack from, so you can compare attacking from different tiles. " +
       "BEHAVIOR: Drives input, despite being a read. The forecast structs are stale garbage until target select is actually on screen, so this selects the unit, walks it to the destination, opens Attack, reads the game's own BattleUnit structs, then unwinds — leaving the unit back on its original tile, unselected and unspent. Nothing is committed. Every number comes from the game, so support, terrain and weapon-triangle bonuses are already included; never recompute these from base stats. " +
-      "RETURNS: One block with each side's damage x blows, effective hit and crit, AS, avoid and dodge, plus the projected post-battle HP — which is a deterministic every-blow-lands projection, NOT a prediction of the real fight.",
+      "RETURNS: One block with each side's damage x blows, effective hit and crit, AS, avoid and dodge, plus the projected post-battle HP — which is a deterministic every-blow-lands projection, NOT a prediction of the real fight. " +
+      "A side that does not fight — a defender that cannot counter at this range, or has no weapon — is reported as NO ATTACK with its numbers WITHHELD, never as zeros. The game populates a BattleUnit only for a side that swings and never clears the pair between battles, so that side's block would otherwise be the previous battle's values formatted as if they were this one's (seen live: 255% hit, 255% crit, 15 blows).",
     inputSchema: {
       type: "object",
       properties: {
@@ -2481,7 +3185,8 @@ export const FE7_TOOLS: Tool[] = [
       "PURPOSE: Work out why the game appears frozen and say exactly what to press. Use it the moment a tool reports that nothing happened, a unit will not move, presses seem ignored, or you cannot tell what is on screen. " +
       "USAGE: Call it first when confused, before trying more presses — guessing costs presses and a wrong A can commit an action. It is safe to call at any time and changes nothing. " +
       "BEHAVIOR: Reads phase, turn, cursor, whether any unit is selected, whether an attack or staff target selection is open, and the ASCII text buffer. Then runs the input-signature probe: it presses one direction away from the map edge and sees what moved — the live cursor (input is being accepted), a menu's index byte and mirror (a menu is open, and it reports the address and entry count), or nothing (input is being swallowed by an event, dialogue, level-up or animation). It presses the opposite direction afterwards, so the probe restores whatever it moved. " +
-      "RETURNS: The state read, the probe result, a verdict naming which of those three cases holds, a concrete recommendation, AND a screenshot. Read the screenshot for WHAT is displayed — dialogue text, the objective, which portrait is up — not for game state; the memory verdict is the checkable answer.",
+      "The TEXT BUFFER outranks the forecast gate in the verdict: a buffer naming a chapter outcome, or holding prose rather than a tile name, decides the verdict before the stale-prone 'forecast populated' signal is consulted at all. That signal previously produced a confident 'possibly attack target selection' while the same output's buffer read \"We've won!!!\". " +
+      "RETURNS: The state read, the probe result, a verdict, a concrete recommendation naming the exact button, AND a screenshot whose byte size is reported — a frame too small to be real is flagged as probably blank or mid-fade, so you are not sent to confirm against a black rectangle. Read the screenshot for WHAT is displayed — dialogue text, the objective, which portrait is up — not for game state; the memory verdict is the checkable answer.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -2527,10 +3232,12 @@ export const FE7_TOOLS: Tool[] = [
   {
     name: "fe7_wait",
     description:
-      "PURPOSE: Wait for the player phase to come back, in a resumable chunk, while pressing A to clear any dialogue that would otherwise stall it forever. " +
+      "PURPOSE: Wait for the player phase to come back, in a resumable chunk, while alternating A and Start to clear any dialogue or cutscene that would otherwise stall it forever. " +
       "USAGE: Call after fe7_end_turn reports the enemy phase is still running, and call it again as many times as needed — each call is a checkpoint that reports what it found. Also safe to call any time you suspect the game is sitting on an event and swallowing input. " +
-      "BEHAVIOR: Drives input. Polls the phase byte and presses A about once a second until the player phase returns or the timeout expires. Pressing A is safe during the enemy phase because the game ignores map input then, while a dialogue box (death quote, reinforcement text, battle result) is dismissed by exactly that press — so this clears events without needing to identify them. On the phase flip it stops pressing and taps B once, in case a press raced the transition and opened a menu. " +
-      "RETURNS: Whether the player phase resumed and on which turn, plus a battlefield summary naming any fallen units and listing wounded survivors.",
+      "BEHAVIOR: Drives input. Polls the phase byte and alternates A and Start about once a second until the player phase returns or the timeout expires. BOTH are needed and they clear different screens: Start skips an event cutscene whole, while a battle or death quote ignores Start entirely and advances only on A. Both are safe during the enemy phase because the game ignores map input then. It does not try to speed the enemy phase itself up; the only way to do that is holding A down, which is blind input this layer exists to avoid. The phase byte flips BEFORE an arrival cutscene finishes, so on the flip it keeps clearing until the cursor actually responds, then taps B — which closes a minimap a late Start opened or a field menu a late A opened, and does nothing at all otherwise. " +
+      "RETURNS: Whether the player phase resumed and on which turn, plus a battlefield summary naming any fallen units and listing wounded survivors. " +
+      "If it times out it says WHY it is worth waiting again: it fingerprints every unit's position and HP across the window, so 'units did move, call again' and 'nothing on the board changed at all, stop and call fe7_unstick' are different answers. " +
+      "It also checks two loss conditions it can prove from the unit arrays — every deployed player dead, or the greens going to zero on a protect chapter — because the phase byte never leaves 0x80 once the chapter is over, so polling alone would wait forever. The game's own game-over flag is not located yet, so that check is reported as a strong inference, not proof.",
     inputSchema: {
       type: "object",
       properties: {
