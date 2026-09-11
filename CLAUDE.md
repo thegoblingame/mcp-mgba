@@ -91,6 +91,14 @@ one that silently cost a unit its turn. Save a state first (`save_state` to an e
   of a misdecoded grid on every map. Written rules did not prevent this bug; that check does.
 - **Long-running tools must be resumable.** Any call that can exceed ~110s gets split into a
   short starter and a resumable waiter, as `fe7_end_turn` / `fe7_wait` are.
+- **Independent calls may be batched.** The server runs MCP requests one at a time, so several
+  `fe7_act` calls in one tool block do not interleave presses (verified 2026-09-10, seven in a
+  block). Batch when no call's inputs depend on another's result; a move into a tile another
+  unit is vacating goes in the next block, since in-block order is not a contract.
+- **Compute from ROM when the game's own answer costs input.** `fe7_threat` reads Move and the
+  terrain-cost table from the class struct and flood-fills, instead of selecting each enemy
+  with A. Same truth, no input, 0.75 s for a map — but keep a `verify` path that reads the
+  game's grid, because the one disagreement found is unexplained.
 
 ## It is a fork
 
