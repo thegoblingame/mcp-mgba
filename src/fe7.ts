@@ -794,41 +794,102 @@ const blows = (s: BattleSide) => Math.max(0, s.usesBefore - s.usesAfter);
  *      every 1-2 weapon decoded to the empty interval and this test would have
  *      called every hand-axe counter impossible.
  */
-async function staleSideReason(
+type SideVerdict =
+  | { kind: "live" }
+  /** Real numbers, but the all-hits projection kills it before it swings. */
+  | { kind: "diesFirst" }
+  | { kind: "absent"; reason: string };
+
+async function sideVerdict(
   m: MgbaClient, s: BattleSide, distance: number | null,
-): Promise<string | null> {
+): Promise<SideVerdict> {
   if (s.effHit > 100 || s.effCrit > 100) {
-    return `its hit/crit read ${s.effHit}%/${s.effCrit}%, and a percentage above 100 means the field was never written (0xFF)`;
+    return {
+      kind: "absent",
+      reason:
+        `its hit/crit read ${s.effHit}%/${s.effCrit}% — 0xFF, never written. The game leaves a side's numbers ` +
+        `unwritten when it has no weapon usable at this range (a sword at range 2, a bow at range 1, or no weapon at all)`,
+    };
   }
   const n = blows(s);
-  if (n > 4) return `it claims ${n} blows, which no weapon in the game can do`;
-  if (n === 0) return `it lands no blows`;
+  if (n > 4) return { kind: "absent", reason: `it claims ${n} blows, which no weapon in the game can do` };
   if (distance !== null && s.weaponId) {
     try {
       const r = await itemRange(m, s.weaponId);
       if (distance < r.min || distance > r.max) {
-        return `its weapon 0x${hex2(s.weaponId)} reaches ${r.min}-${r.max} and this fight is at range ${distance}`;
+        return {
+          kind: "absent",
+          reason: `its weapon 0x${hex2(s.weaponId)} reaches ${r.min}-${r.max} and this fight is at range ${distance}`,
+        };
       }
     } catch {
       // An undecodable weapon id is itself evidence the side is stale, but the
       // value tests above are the ones that own that verdict.
     }
   }
-  return null;
+  if (n === 0) {
+    // Zero blows with real numbers has two causes, and the projected HP tells
+    // them apart: a side the simulation killed before its turn to swing sits
+    // at 0, while leftovers from an earlier battle do not. Seen live on Ch.7x:
+    // Kent vs a 1 HP brigand at range 1 read hit 70%, 0 blows, projected 0.
+    if (s.projHp === 0) return { kind: "diesFirst" };
+    return { kind: "absent", reason: `it lands no blows yet is not projected to die, so its block is leftovers` };
+  }
+  return { kind: "live" };
 }
 
-function formatSide(label: string, s: BattleSide, oppDef: number, stale: string | null = null): string {
-  if (stale) {
+/**
+ * Displayed hit% -> the probability the blow actually lands.
+ *
+ * FE7 does not roll one number against the displayed hit. It rolls TWO
+ * integers in 0..99, averages them with integer division, and the blow lands
+ * if that average is below the displayed hit. Averaging pulls the distribution
+ * toward 50, so a displayed 70 lands 81.7% of the time and a displayed 30 only
+ * 18.3%. Crit is a single roll, so its displayed value is already the truth.
+ *
+ * Exact count: the blow lands iff r1 + r2 < 2h, i.e. r1 + r2 <= 2h - 1. Pairs
+ * with sum <= k number (k+1)(k+2)/2 for k <= 99 and 10000 - (199-k)(200-k)/2
+ * above that, out of 10000 equally likely pairs. Matches the community 2-RN
+ * tables (50 -> 50.5, 80 -> 91.8, 85 -> 95.4).
+ *
+ * This is arithmetic a player can do from the numbers on screen. It is NOT a
+ * read of the RNG state and must never become one: the project rule is that
+ * tools may only use what a human could see by looking at the game.
+ */
+export function trueHit(displayed: number): number {
+  if (displayed <= 0) return 0;
+  if (displayed >= 100) return 100;
+  const k = 2 * displayed - 1;
+  const pairs = k <= 99 ? ((k + 1) * (k + 2)) / 2 : 10000 - ((199 - k) * (200 - k)) / 2;
+  return pairs / 100;
+}
+
+const pct = (v: number): string => (Number.isInteger(v) ? `${v}` : v.toFixed(1));
+
+/**
+ * One side of the forecast, as a line. `opp` is the other side: its DEF sets
+ * this side's damage, and in the dies-first case its hit decides whether this
+ * side ever gets to swing.
+ */
+function formatSide(label: string, s: BattleSide, opp: BattleSide, v: SideVerdict): string {
+  if (v.kind === "absent") {
     return (
-      `${label}: NO ATTACK — ${stale}. Numbers withheld: this side's struct is not populated for ` +
+      `${label}: NO ATTACK — ${v.reason}. Numbers withheld: this side's struct is not populated for ` +
       `this fight, so what is in it belongs to an earlier battle. Treat it as absent, not as zero.`
     );
   }
-  const dmg = Math.max(0, s.atk - oppDef);
-  const n = blows(s);
+  const dmg = Math.max(0, s.atk - opp.def);
+  const stats =
+    `dmg ${dmg}${v.kind === "live" ? ` x${blows(s)}` : ""} (ATK ${s.atk} - DEF ${opp.def})  ` +
+    `hit ${s.effHit}% (true ${pct(trueHit(s.effHit))}%)  crit ${s.effCrit}%  AS ${s.as}  avo ${s.avo}  ddg ${s.dodge}`;
+  if (v.kind === "live") return `${label}: ${stats}`;
+  // Dies-first. The attacker always swings first in FE7, so this side counters
+  // exactly when that first blow misses; if it does, this side lands its own
+  // blow at its own true hit.
+  const survive = 100 - trueHit(opp.effHit);
   return (
-    `${label}: dmg ${dmg} x${n} (ATK ${s.atk} - DEF ${oppDef})  hit ${s.effHit}%  crit ${s.effCrit}%  ` +
-    `AS ${s.as}  avo ${s.avo}  ddg ${s.dodge}`
+    `${label}: dies to the other side's FIRST blow in the all-hits projection, so it swings 0 times there. ` +
+    `It DOES counter if that blow misses — ${pct(survive)}% chance — and then: ${stats}`
   );
 }
 
@@ -1941,13 +2002,13 @@ async function fe7Act(
         const f = await readForecast(m);
         const tt = await battleTargetTile(m);
         const dist = tt ? Math.abs(tt.x - destX) + Math.abs(tt.y - destY) : null;
-        const [aStale, dStale] = await Promise.all([
-          staleSideReason(m, f.actor, dist),
-          staleSideReason(m, f.target, dist),
+        const [aV, dV] = await Promise.all([
+          sideVerdict(m, f.actor, dist),
+          sideVerdict(m, f.target, dist),
         ]);
         forecast =
-          `\n  forecast  ${formatSide("attacker", f.actor, f.target.def, aStale)}` +
-          `\n            ${formatSide("defender", f.target, f.actor.def, dStale)}`;
+          `\n  forecast  ${formatSide("attacker", f.actor, f.target, aV)}` +
+          `\n            ${formatSide("defender", f.target, f.actor, dV)}`;
       }
       // Stop pressing as soon as EITHER the unit is spent OR combat has visibly
       // started (any adjacent enemy's HP moved, or it died and left a hole).
@@ -2374,9 +2435,9 @@ async function fe7Forecast(
     const t = await battleTargetTile(m);
     const foe = t ? enemies.find((e) => e.x === t.x && e.y === t.y) ?? null : null;
     const dist = t ? Math.abs(t.x - destX) + Math.abs(t.y - destY) : null;
-    const [aStale, dStale] = await Promise.all([
-      staleSideReason(m, f.actor, dist),
-      staleSideReason(m, f.target, dist),
+    const [aV, dV] = await Promise.all([
+      sideVerdict(m, f.actor, dist),
+      sideVerdict(m, f.target, dist),
     ]);
 
     const restored = await unwind(m, slot, startX, startY);
@@ -2384,8 +2445,8 @@ async function fe7Forecast(
       `Forecast — unit #${slot} cls${hex2(u.classId)} attacking from (${destX},${destY})` +
         (foe ? ` vs enemy #${foe.slot} cls${hex2(foe.classId)} at (${foe.x},${foe.y}) HP ${foe.hp}/${foe.maxHp}`
              : t ? ` vs the unit on (${t.x},${t.y}) (not matched to an enemy slot)` : ""),
-      `  ${formatSide("attacker", f.actor, f.target.def, aStale)}`,
-      `  ${formatSide("defender", f.target, f.actor.def, dStale)}`,
+      `  ${formatSide("attacker", f.actor, f.target, aV)}`,
+      `  ${formatSide("defender", f.target, f.actor, dV)}`,
       `  projected HP after: attacker ${f.actor.projHp}, defender ${f.target.projHp}` +
         `  <- a deterministic every-blow-lands projection, NOT a prediction; real combat rolls hit and crit`,
       restored
@@ -2993,7 +3054,21 @@ async function lossSignal(m: MgbaClient, greensBefore: number): Promise<string |
 
 async function fe7Wait(m: MgbaClient, timeoutMs: number): Promise<string> {
   const pre = await readRange(m, A.phase, 2);
-  if (pre[0] === 0x00) return `Already the player phase (turn ${pre[1]}).\n${await battlefieldSummary(m)}`;
+  if (pre[0] === 0x00) {
+    // The phase flipped between fe7_end_turn's short window and this call.
+    // fe7_end_turn left its pre-phase baseline in lastSnap; if that baseline
+    // is from an older turn, the whole enemy phase happened unobserved and
+    // this is the only call that can still report it. Seen on Ch.7x turn 4:
+    // this branch used to return without the diff and the phase went missing.
+    const summary = await battlefieldSummary(m);
+    if (lastSnap && lastSnap.turn < pre[1]) {
+      const now = await takeSnap(m);
+      const changes = `\nWHAT HAPPENED WHILE YOU WERE NOT LOOKING (turn ${lastSnap.turn} -> ${now.turn}):\n${diffSnap(lastSnap, now)}`;
+      lastSnap = now;
+      return `Already the player phase (turn ${pre[1]}) — it came back between calls.\n${summary}${changes}`;
+    }
+    return `Already the player phase (turn ${pre[1]}).\n${summary}`;
+  }
 
   const greensBefore = (await readArray(m, A.greenArray)).filter((g) => g.deployed && !g.dead).length;
   const fpBefore = await boardFingerprint(m);
@@ -3143,6 +3218,197 @@ async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
   );
 }
 
+// ── Enemy threat map ───────────────────────────────────────────────────────
+//
+// Every enemy's reach, computed rather than selected. The game's own grid for
+// an enemy costs a cursor walk plus A/B (measured 1.5-5.1 s each, 35 s for 14
+// enemies on Ch.8); this costs nothing and reproduced that grid tile-for-tile
+// on 13 of 14 enemies. The one disagreement is written up in RAM.md ("Enemy
+// movement range"): the fill can OVER-claim a tile at exact budget, which is
+// the safe direction for a danger map. `verify` exists to check any single
+// enemy against the game when a decision hangs on one tile.
+//
+// Move and the terrain-cost table come from the class struct in ROM. That is
+// static data, the same truth a hand-typed table would hold, minus the
+// transcription — and it never has to be maintained when a class is added.
+
+interface ClassMove { move: number; cost: number[] }
+const classMoveCache = new Map<number, ClassMove>();
+
+/** Move (class+0x12) and the terrain-cost table (class+0x38, indexed by terrain id, 0xFF impassable). */
+async function classMove(m: MgbaClient, classId: number): Promise<ClassMove> {
+  const hit = classMoveCache.get(classId);
+  if (hit) return hit;
+  const ptr = CLASS_BASE + classId * CLASS_STRIDE;
+  const c = await readRange(m, ptr, CLASS_STRIDE);
+  const move = c[0x12];
+  const tablePtr = u32(c, 0x38);
+  // Cheap invariants: a real class has a small Move and a ROM cost table.
+  if (move < 1 || move > 15 || tablePtr < 0x08000000 || tablePtr >= 0x0a000000) {
+    throw new Error(
+      `class 0x${hex2(classId)} at 0x${ptr.toString(16)} decodes to Move ${move} and cost table ` +
+      `0x${tablePtr.toString(16)} — that is not a class struct; the class id or CLASS_BASE is wrong.`);
+  }
+  const cost = await readRange(m, tablePtr, 0x41);
+  const info = { move, cost };
+  classMoveCache.set(classId, info);
+  return info;
+}
+
+/** Dijkstra over the terrain layer. Returns cost per tile, UNREACHABLE where the unit cannot go. */
+function floodMove(
+  ox: number, oy: number, cm: ClassMove, terrain: number[][], width: number, height: number, blocked: Set<string>,
+): number[][] {
+  const best: number[][] = Array.from({ length: height }, () => new Array<number>(width).fill(UNREACHABLE));
+  best[oy][ox] = 0;
+  const queue: Array<[number, number]> = [[ox, oy]];
+  while (queue.length) {
+    const [x, y] = queue.shift()!;
+    const d = best[y][x];
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]] as const) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      if (blocked.has(`${nx},${ny}`)) continue;
+      const c = cm.cost[terrain[ny][nx]];
+      if (c === undefined || c === UNREACHABLE) continue;
+      const nd = d + c;
+      if (nd > cm.move || nd >= best[ny][nx]) continue;
+      best[ny][nx] = nd;
+      queue.push([nx, ny]);
+    }
+  }
+  return best;
+}
+
+/** Ranges of every weapon the unit carries and has a rank for. Staves and consumables excluded. */
+async function weaponReaches(m: MgbaClient, u: Unit): Promise<Array<{ id: number; min: number; max: number }>> {
+  const out: Array<{ id: number; min: number; max: number }> = [];
+  for (const it of u.items) {
+    const t = await itemType(m, it.id);
+    if (t > 7 || t === WTYPE_STAFF) continue;
+    if ((u.ranks[t] ?? 0) === 0) continue;
+    out.push({ id: it.id, ...(await itemRange(m, it.id)) });
+  }
+  return out;
+}
+
+async function fe7Threat(m: MgbaClient, verifySlot: number | null): Promise<string> {
+  const { width, height } = await readMapSize(m);
+  const terrain = await readLayer(m, LAYER.terrain, width, height);
+  const [players, enemies, greens] = await Promise.all([
+    readArray(m, A.playerArray), readArray(m, A.enemyArray), readArray(m, A.greenArray),
+  ]);
+  const live = (us: Unit[]) => us.filter((u) => u.deployed && !u.dead);
+  // Player and green units block an enemy's path; other enemies are pass-through.
+  const blocked = new Set([...live(players), ...live(greens)].map((u) => `${u.x},${u.y}`));
+
+  const count: number[][] = Array.from({ length: height }, () => new Array<number>(width).fill(0));
+  const attackers: Map<string, number[]> = new Map();
+  const perEnemy: string[] = [];
+  const fills = new Map<number, number[][]>();
+
+  for (const e of live(enemies)) {
+    const cm = await classMove(m, e.classId);
+    const reach = floodMove(e.x, e.y, cm, terrain, width, height, blocked);
+    fills.set(e.slot, reach);
+    const weapons = await weaponReaches(m, e);
+    const hit = new Set<string>();
+    let reachN = 0;
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      if (reach[y][x] === UNREACHABLE) continue;
+      reachN++;
+      for (const w of weapons) {
+        for (let dy = -w.max; dy <= w.max; dy++) for (let dx = -w.max; dx <= w.max; dx++) {
+          const dist = Math.abs(dx) + Math.abs(dy);
+          if (dist < w.min || dist > w.max) continue;
+          const tx = x + dx, ty = y + dy;
+          if (tx < 0 || ty < 0 || tx >= width || ty >= height) continue;
+          hit.add(`${tx},${ty}`);
+        }
+      }
+    }
+    for (const k of hit) {
+      const [tx, ty] = k.split(",").map(Number);
+      count[ty][tx]++;
+      (attackers.get(k) ?? attackers.set(k, []).get(k)!).push(e.slot);
+    }
+    perEnemy.push(
+      `  E#${e.slot} cls${hex2(e.classId)} (${e.x},${e.y}) HP ${e.hp}/${e.maxHp} Move ${cm.move}: reaches ${reachN} tiles, ` +
+      (weapons.length
+        ? `weapons ${weapons.map((w) => `${hex2(w.id)}:${w.min}-${w.max}`).join(",")}, can attack ${hit.size} tiles`
+        : `NO USABLE WEAPON — threatens nothing`),
+    );
+  }
+
+  const L: string[] = [
+    `THREAT — how many enemies can ATTACK each tile this enemy phase (move + weapon range), ` +
+    `map ${width}x${height}, ${live(enemies).length} enemies. Computed from ROM Move/cost tables + terrain; ` +
+    `see RAM.md "Enemy movement range" for the one known over-claim.`,
+    `     ${Array.from({ length: width }, (_, x) => String(x % 10)).join(" ")}`,
+  ];
+  for (let y = 0; y < height; y++) {
+    L.push(`  ${String(y).padStart(2, " ")} ` + count[y].map((n) => (n === 0 ? "." : n < 10 ? String(n) : "+")).join(" "));
+  }
+  L.push(`  . = no enemy can attack it   digit = number of enemies that can   + = 10 or more`);
+  L.push(`  (tiles are counted whether or not something stands on them; an enemy's own tile is included)`);
+
+  L.push("");
+  L.push("YOUR UNITS:");
+  for (const p of live(players)) {
+    const who = attackers.get(`${p.x},${p.y}`) ?? [];
+    L.push(
+      `  #${p.slot} cls${hex2(p.classId)} (${p.x},${p.y}) HP ${p.hp}/${p.maxHp}: ` +
+      (who.length ? `threatened by ${who.length} — ${who.map((s) => `E#${s}`).join(", ")}` : `safe`),
+    );
+  }
+  L.push("");
+  L.push("ENEMIES:");
+  L.push(...perEnemy);
+
+  if (verifySlot !== null) {
+    L.push("");
+    L.push(await verifyThreat(m, verifySlot, enemies, fills, width, height));
+  }
+  return L.join("\n");
+}
+
+/** Select one enemy with A, read the game's grid, back out with B, and diff it against the fill. */
+async function verifyThreat(
+  m: MgbaClient, slot: number, enemies: Unit[], fills: Map<number, number[][]>, width: number, height: number,
+): Promise<string> {
+  const e = bySlot(enemies, slot);
+  const mine = fills.get(slot);
+  if (!e || !mine || !e.deployed || e.dead) return `VERIFY E#${slot}: no live enemy in that slot — nothing selected.`;
+  const phase = (await readRange(m, A.phase, 1))[0];
+  if (phase !== 0x00) return `VERIFY E#${slot}: skipped — selecting a unit needs the player phase (phase is 0x${hex2(phase)}).`;
+
+  if (!(await moveCursorTo(m, e.x, e.y))) return `VERIFY E#${slot}: the cursor would not reach (${e.x},${e.y}); nothing pressed.`;
+  await press(m, [{ buttons: ["A"], frames: 4, release_frames: 8 }]);
+  let grid: Grid | null = null;
+  await waitUntil(async () => {
+    const g = await readGrid(m);
+    const o = gridOrigin(g);
+    if (o && o.x === e.x && o.y === e.y) { grid = g; return true; }
+    return false;
+  }, 3000, 50);
+  await press(m, [{ buttons: ["B"], frames: 4, release_frames: 8 }]);
+  if (!grid) return `VERIFY E#${slot}: pressed A on (${e.x},${e.y}) but the movement grid never showed cost 0 there — the selection did not open. Pressed B.`;
+  const g = grid as Grid;
+  const diffs: string[] = [];
+  let gameReach = 0, mineReach = 0;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const gv = g.rows[y]?.[x] ?? UNREACHABLE, mv = mine[y][x];
+    if (gv !== UNREACHABLE) gameReach++;
+    if (mv !== UNREACHABLE) mineReach++;
+    if (gv !== mv) diffs.push(`(${x},${y}) game=${gv === UNREACHABLE ? "X" : gv} fill=${mv === UNREACHABLE ? "X" : mv}`);
+  }
+  const shown = diffs.slice(0, 12).join("; ") + (diffs.length > 12 ? `; …${diffs.length - 12} more` : "");
+  return diffs.length
+    ? `VERIFY E#${slot}: game grid reaches ${gameReach} tiles, fill ${mineReach}; ${diffs.length} tile(s) differ -> ${shown}. ` +
+      `Trust the game's values for this enemy. (Selected with A, backed out with B; cursor left on (${e.x},${e.y}).)`
+    : `VERIFY E#${slot}: game grid and fill agree on every tile (${gameReach} reachable). (Selected with A, backed out with B; cursor left on (${e.x},${e.y}).)`;
+}
+
 // ── Tool definitions ───────────────────────────────────────────────────────
 
 export const FE7_TOOLS: Tool[] = [
@@ -3159,6 +3425,24 @@ export const FE7_TOOLS: Tool[] = [
         brief: {
           type: "boolean",
           description: "Omit stats and items, listing only slot/class/position/HP. Much cheaper; use when you only need to plan movement.",
+        },
+      },
+    },
+  },
+  {
+    name: "fe7_threat",
+    description:
+      "PURPOSE: The enemy DANGER MAP in one call — for every tile, how many enemies could attack it on the coming enemy phase (movement plus weapon range), plus which enemies threaten each of your units. " +
+      "USAGE: Call it every turn before deciding where to stand, and before ending the turn. A digit under a destination means that many enemies can hit it; '.' means none. The YOUR UNITS section names the attackers per unit so a lethal combination can be seen without pathing by hand. " +
+      "BEHAVIOR: Pure read by default — no input, no cursor movement. Each enemy's reach is a flood fill over the game's terrain layer using its class's Move and terrain-cost table read from ROM (static per class, one cached read each), with your units and green NPCs as blockers and other enemies as pass-through; attack tiles come from the weapon ranges in the ROM item table for weapons the unit has a rank in. Checked against the game's own movement grid on Ch.8: 13 of 14 enemies matched tile-for-tile, and the one known disagreement OVER-claims a tile at exact Move, i.e. the map errs toward danger. " +
+      "Pass `verify` with an enemy slot to have the tool select that enemy with A, read the game's real grid, back out with B, and print every tile where the two disagree — use it when a plan hangs on one tile. That path drives input and needs the player phase. " +
+      "RETURNS: a count grid with the map's coordinates, a per-player line (safe / threatened by N — E#a, E#b), and a per-enemy line with Move, reachable-tile count, weapons with ranges, and attackable-tile count. Unit-level Move bonuses (Boots) are not read; enemies never have them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        verify: {
+          type: "number",
+          description: "Enemy array slot (as printed by fe7_state) to cross-check against the game's own movement grid. Drives input: cursor walk, A, B. Omit for the pure-read map.",
         },
       },
     },
@@ -3282,7 +3566,9 @@ export const FE7_TOOLS: Tool[] = [
       "USAGE: Call this before fe7_act(action='attack') whenever the trade matters: a wounded unit, a possible kill, or a choice between targets. Pass the destination tile you would attack from, so you can compare attacking from different tiles. " +
       "BEHAVIOR: Drives input, despite being a read. The forecast structs are stale garbage until target select is actually on screen, so this selects the unit, walks it to the destination, opens Attack, reads the game's own BattleUnit structs, then unwinds — leaving the unit back on its original tile, unselected and unspent. Nothing is committed. Every number comes from the game, so support, terrain and weapon-triangle bonuses are already included; never recompute these from base stats. " +
       "RETURNS: One block with each side's damage x blows, effective hit and crit, AS, avoid and dodge, plus the projected post-battle HP — which is a deterministic every-blow-lands projection, NOT a prediction of the real fight. " +
-      "A side that does not fight — a defender that cannot counter at this range, or has no weapon — is reported as NO ATTACK with its numbers WITHHELD, never as zeros. The game populates a BattleUnit only for a side that swings and never clears the pair between battles, so that side's block would otherwise be the previous battle's values formatted as if they were this one's (seen live: 255% hit, 255% crit, 15 blows).",
+      "Hit is printed twice: the game's displayed value and the TRUE chance in parentheses. FE7 averages two rolls per blow, so displayed 70 lands 81.7% and displayed 30 only 18.3% — plan on the true number. Crit is a single roll and is already true. " +
+      "A defender the projection kills before it swings is reported as 'dies to the FIRST blow' together with the chance the attacker's first blow misses — that is the chance the counter happens at all — and the counter's own damage and true hit, so a lethal counter can be weighed rather than hidden. " +
+      "A side that cannot fight — a defender with no weapon usable at this range — is reported as NO ATTACK with its numbers WITHHELD, never as zeros. The game leaves that side's hit/crit at 0xFF and never clears the pair between battles, so its block would otherwise be the previous battle's values formatted as if they were this one's (seen live: 255% hit, 255% crit, 15 blows).",
     inputSchema: {
       type: "object",
       properties: {
@@ -3414,6 +3700,9 @@ async function dispatchFe7(
   switch (name) {
     case "fe7_state":
       return wrap(await fe7State(m, p.brief === true));
+
+    case "fe7_threat":
+      return wrap(await fe7Threat(m, p.verify === undefined ? null : Number(p.verify)));
 
     case "fe7_terrain":
       return wrap(await fe7Terrain(m, p.find === undefined ? "" : String(p.find)));
