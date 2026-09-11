@@ -24,7 +24,8 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { MgbaClient } from "./mgba.js";
 import { readFile, unlink, appendFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 
 // ── Addresses (US release, ROM title FIREEMBLEME / AGB-AE7E) ────────────────
 
@@ -2733,7 +2734,14 @@ async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }
 
   let png: string | undefined;
   try {
-    const path = await m.call<string>("screenshot", {});
+    // Generate the temp path HERE instead of letting the bridge default it.
+    // bridge.lua falls back to Lua's os.tmpname(), which on Windows returns a
+    // name relative to the CURRENT DRIVE ROOT ("\s9a4.") and so yields an
+    // unwritable "C:\s9a4..png"; the write fails silently and only surfaces as
+    // an ENOENT here. os.tmpdir() resolves %TEMP% on Windows and $TMPDIR on
+    // macOS, so this is correct on both without branching.
+    const path = join(tmpdir(), `mgba-unstick-${process.pid}-${Date.now()}.png`);
+    await m.call<string>("screenshot", { path });
     const buf = await readFile(path);
     png = buf.toString("base64");
     // A mid-fade or blank frame compresses to almost nothing. Telling the caller

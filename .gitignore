@@ -8,3 +8,12 @@ dist/
 
 # Local agent context - not part of the repo or the published package.
 CLAUDE.md
+
+# Vision experiment artifacts and local secrets (never package credentials).
+artifacts/
+runs/
+logs/
+.env
+.env.*
+!.env.example
+*.local.json

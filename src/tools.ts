@@ -6,6 +6,10 @@ import {
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { MgbaClient } from "./mgba.js";
 import { FE7_TOOLS, handleFe7 } from "./fe7.js";
+import { VALID_KEYS, submitButtons, submitSequence } from "./input.js";
+import { screenshotResult } from "./screenshot.js";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // Address-space cheat sheets (used in tool descriptions). The bridge works on
 // any platform mGBA supports; users running GB/GBC ROMs need a different map.
@@ -37,7 +41,6 @@ const MBC_CAVEAT =
   "regardless of MBC enable state. To seed cartridge SRAM cleanly, use mgba_save_state / mgba_load_state " +
   "with a pre-prepared state file.";
 
-const VALID_KEYS = ["A", "B", "Select", "Start", "Right", "Left", "Up", "Down", "R", "L"];
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Tool descriptions are written to the TDQS rubric (Glama's Tool Definition
@@ -634,17 +637,17 @@ const TOOLS: Tool[] = [
   {
     name: "mgba_screenshot",
     description:
-      "PURPOSE: Save a PNG screenshot of the current emulator display. " +
-      "USAGE: For visual inspection or sequence documentation. To capture a specific frame, pause / advance / load_state first. For full machine state (RAM, registers, mapper) use mgba_save_state instead — screenshots are pixels only, not state. " +
+      "PURPOSE: Save a native PNG screenshot and return the display as an inline image for visual inspection. " +
+      "USAGE: Observe the current screen when visual information would help choose the next action. Does not pause emulation or send controller input. " +
       "BEHAVIOR: DESTRUCTIVE to `path` if supplied (overwrites without prompt). Errors if `path`'s parent doesn't exist or isn't writable, or if the build doesn't expose screenshot. " +
-      "RETURNS: 'Screenshot saved: PATH' — the path you passed, or mGBA's default-directory filename if `path` was omitted.",
+      "RETURNS: Saved path and dimensions plus an inline PNG enlarged 3x using nearest-neighbor scaling (720x480 for GBA). The saved native PNG is unchanged.",
     inputSchema: {
       type: "object",
       properties: {
         path: {
           type: "string",
           description:
-            "Optional absolute PNG path (e.g. C:/temp/snap.png, /tmp/snap.png). Parent must exist; file is overwritten without prompt. Omit to let mGBA choose a filename in its default screenshot directory and return that path.",
+            "Optional absolute PNG path (e.g. C:/temp/snap.png, /tmp/snap.png). Parent must exist; file is overwritten without prompt. Omit to write a uniquely-named file into the system temp directory (%TEMP% on Windows, $TMPDIR on macOS) and return that path.",
         },
       },
       additionalProperties: false,
@@ -834,11 +837,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
       }
 
       case "mgba_press_buttons": {
-        const r = await mgba.call<{ queued: boolean; queue_size: number }>("press_buttons", {
-          buttons:        p.buttons,
-          frames:         p.frames         ?? 1,
-          release_frames: p.release_frames ?? 1,
-        });
+        const r = await submitButtons(mgba.call.bind(mgba), p);
         const keys = (p.buttons as string[]).join("+");
         return ok(
           `Queued press: ${keys} ` +
@@ -950,11 +949,7 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
       }
 
       case "mgba_press_sequence": {
-        const r = await mgba.call<{ queued: number; queue_size: number; frames: number }>("press_sequence", {
-          presses: p.presses,
-          ...(p.frames         !== undefined ? { frames:         p.frames }         : {}),
-          ...(p.release_frames !== undefined ? { release_frames: p.release_frames } : {}),
-        });
+        const r = await submitSequence(mgba.call.bind(mgba), p);
 
         if (p.wait === false) {
           return ok(`Queued ${r.queued} press(es), ${r.frames} frames. Queue size: ${r.queue_size}`);
@@ -992,8 +987,10 @@ export function registerTools(server: Server, mgba: MgbaClient): void {
       }
 
       case "mgba_screenshot": {
-        const path = await mgba.call<string>("screenshot", p.path ? { path: p.path } : {});
-        return ok(`Screenshot saved: ${path}`);
+        // Always supply a path. Omitting it makes bridge.lua fall back to
+        // Lua's os.tmpname(), which is unusable on Windows (see fe7.ts).
+        const path: string = (p.path as string | undefined) ?? join(tmpdir(), `mgba-shot-${process.pid}-${Date.now()}.png`);
+        return screenshotResult(await mgba.call<string>("screenshot", { path }));
       }
 
       case "mgba_save_state": {
