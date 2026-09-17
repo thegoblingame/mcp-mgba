@@ -290,6 +290,38 @@ async function skipWhile(
   return ok;
 }
 
+/**
+ * skipWhile for the moment after a COMMITTED ATTACK, with one extra stop: the
+ * inventory-full prompt. A drop into a full inventory halts the game on an item
+ * list where A sends the highlighted entry — the equipped weapon — straight to
+ * the convoy, so the check runs before EVERY press and the loop halts and hands
+ * the choice back the instant it is up. No trailing B in that case either.
+ */
+async function skipCombat(
+  m: MgbaClient,
+  done: () => Promise<boolean>,
+  timeoutMs: number,
+): Promise<{ ok: boolean; prompt: InvPrompt | null }> {
+  const deadline = Date.now() + timeoutMs;
+  let ok = false;
+  let i = 0;
+  for (;;) {
+    if (await done()) { ok = true; break; }
+    if (Date.now() >= deadline) break;
+    const pr = await inventoryFullIfHinted(m, true);
+    if (pr) return { ok: false, prompt: pr };
+    await press(m, [{ buttons: [i++ % 2 === 0 ? "A" : "Start"], frames: 4, release_frames: 14 }]);
+    await sleep(SKIP_CADENCE_MS);
+  }
+  // The prompt can surface a beat after the has-acted flag settles (the "got an
+  // item" box comes first). One last look before the tidy-up B.
+  await sleep(300);
+  const late = await inventoryFullIfHinted(m, true);
+  if (late) return { ok, prompt: late };
+  await press(m, [{ buttons: ["B"], frames: 4, release_frames: 16 }]);
+  return { ok, prompt: null };
+}
+
 // ── Unit decoding ──────────────────────────────────────────────────────────
 
 export interface Unit {
@@ -711,6 +743,338 @@ async function staffSlots(m: MgbaClient, u: Unit): Promise<number[]> {
     if ((await itemType(m, u.items[i].id)) === WTYPE_STAFF) out.push(i);
   }
   return out;
+}
+
+// ── Inventory-full prompt ──────────────────────────────────────────────────
+//
+// When a unit with five items kills (or is attacked by, and kills on the
+// counter) an enemy that drops one, the game halts on an item list: "Your
+// inventory is full. Send an item to Merlinus." (or a discard variant with no
+// convoy). The list is the unit's five items in inventory order plus the new one
+// last, and A on an entry sends it AT ONCE, no confirmation. Every A/Start loop
+// in this file used to walk straight into that and would have sent the
+// highlighted entry 0 — the unit's equipped weapon — to the convoy. Seen live on
+// Ch.20 turn 4 during the enemy phase; the phase byte just stayed 0x80.
+//
+// Detection is two-signal: the text buffer names the prompt, AND locateMenu
+// finds a menu whose index moves (that probe is a Down/Up on the list, which
+// only wiggles the highlight and puts it back). The receiver and the dropper
+// come from the battle structs, which still hold both combatants: whichever
+// side's character pointer matches a player unit received the item.
+
+/** Unit state bit that makes an enemy drop its LAST item on death. Confirmed live on Ch.20: the longbow archer that drops read 0x1000, a non-dropping archer 0, and 0x400000 (first guess, from the FE8 decomp) marked units that had merely acted. */
+const UNIT_STATE_DROP_ITEM = 0x00001000;
+
+function dropTag(u: Unit): string {
+  return (u.flags & UNIT_STATE_DROP_ITEM) !== 0 && u.items.length
+    ? ` DROPS 0x${hex2(u.items[u.items.length - 1].id)}`
+    : "";
+}
+
+type InvPrompt = {
+  kind: "send" | "discard";
+  text: string;
+  menuAddr: number;
+  count: number;
+  index: number;
+  receiver: Unit | null;
+  dropper: Unit | null;
+  newItem: number | null;
+};
+
+const INV_FULL_RE = /inventory is full|send an item|no room|discard/i;
+
+async function inventoryFullHint(m: MgbaClient): Promise<string | null> {
+  const t = await readText(m, 96);
+  return INV_FULL_RE.test(t) ? t : null;
+}
+
+/**
+ * Check for the prompt. `probe` = run the menu check even when the text buffer
+ * does not hint. The text is NOT a reliable gate: on Ch.20 turn 2 the prompt
+ * took Lucius's Lightning (entry 0) while the buffer never named it — it read
+ * "Lucius" afterwards. So every place a stray A could land on the list probes
+ * the menu directly; the text only helps classify send vs discard.
+ */
+async function inventoryFullIfHinted(m: MgbaClient, probe = false): Promise<InvPrompt | null> {
+  const t = await inventoryFullHint(m);
+  if (!t && !probe) return null;
+  return inventoryFullPrompt(m, t ?? undefined);
+}
+
+/**
+ * Could a drop into a full inventory happen at all right now? Only if some
+ * deployed player holds 5 items AND some living enemy carries the drop bit.
+ * When it cannot, the enemy-phase loop skips the per-beat menu probe.
+ */
+async function dropRisk(m: MgbaClient): Promise<boolean> {
+  const [players, enemies] = await Promise.all([readArray(m, A.playerArray), readArray(m, A.enemyArray)]);
+  return players.some((u) => u.deployed && !u.dead && u.items.length >= 5) &&
+    enemies.some((e) => !e.dead && (e.flags & UNIT_STATE_DROP_ITEM) !== 0 && e.items.length > 0);
+}
+
+async function inventoryFullPrompt(m: MgbaClient, text?: string): Promise<InvPrompt | null> {
+  const t = text ?? (await inventoryFullHint(m));
+  const menu = await locateMenu(m);
+  if (!menu) return null;
+  const [players, enemies, ab, tb] = await Promise.all([
+    readArray(m, A.playerArray), readArray(m, A.enemyArray),
+    readRange(m, A.battleActor, UNIT_STRIDE), readRange(m, A.battleTarget, UNIT_STRIDE),
+  ]);
+  const actor = decodeUnit(ab, 0, 0, A.battleActor);
+  const target = decodeUnit(tb, 0, 0, A.battleTarget);
+  const byPtr = (us: Unit[], ptr: number) => us.find((u) => u.charPtr === ptr) ?? null;
+  let receiver: Unit | null = null, dropper: Unit | null = null, dropCopy: Unit | null = null;
+  if (actor && byPtr(players, actor.charPtr)) {
+    receiver = byPtr(players, actor.charPtr);
+    dropper = target ? byPtr(enemies, target.charPtr) : null;
+    dropCopy = target;
+  } else if (target && byPtr(players, target.charPtr)) {
+    receiver = byPtr(players, target.charPtr);
+    dropper = actor ? byPtr(enemies, actor.charPtr) : null;
+    dropCopy = actor;
+  }
+  // The drop is the dropper's LAST item. Prefer the live enemy record; if the
+  // game already stripped it, fall back to the battle copy (whose inventory is
+  // reordered equipped-first, so this is a best effort, and is labelled so).
+  // Who dropped it. On the enemy phase the battle structs are already stale by
+  // the time the list is up: the item-get sequence reuses gBattleActor for the
+  // RECEIVER (seen live — the "new item" resolved to Sain's own Silver Card while
+  // the list showed a Steel Lance). So prefer the live enemy array: a dead enemy
+  // carrying the drop bit whose record still lists its items. The struct copy is
+  // only a fallback, and never when it is a copy of the receiver itself.
+  const deadDroppers = enemies.filter((e) => e.dead && (e.flags & UNIT_STATE_DROP_ITEM) !== 0 && e.items.length > 0);
+  if (deadDroppers.length === 1) dropper = deadDroppers[0];
+  else if (deadDroppers.length > 1 && !(dropper && deadDroppers.includes(dropper))) dropper = null;
+  let newItem: number | null = null;
+  if (dropper && dropper.items.length) {
+    newItem = dropper.items[dropper.items.length - 1].id;
+  } else if (dropCopy && dropCopy.items.length && !(receiver && dropCopy.charPtr === receiver.charPtr)) {
+    newItem = dropCopy.items[dropCopy.items.length - 1].id;
+  }
+  // Without the text, the open list must at least be the right shape: a full
+  // receiver, and one entry more than it carries. With the text, trust it.
+  if (!receiver) return null;
+  if (!t && (receiver.items.length < 5 || menu.count !== receiver.items.length + 1)) return null;
+  const merlinus = players.some((u) => u.deployed && !u.dead && u.classId === 0x44);
+  const kind: "send" | "discard" = t
+    ? (/discard/i.test(t) && !/send an item/i.test(t) ? "discard" : "send")
+    : (merlinus ? "send" : "discard");
+  return {
+    kind,
+    text: t ?? "(the text buffer did not name it — identified from the open list and the battle structs)",
+    menuAddr: menu.addr, count: menu.count, index: menu.index, receiver, dropper, newItem,
+  };
+}
+
+function formatInvPrompt(p: InvPrompt): string {
+  const L: string[] = [];
+  L.push(`INVENTORY FULL PROMPT is on screen (${p.kind === "send" ? "send one item to Merlinus" : "discard one item"}); text: ${JSON.stringify(p.text.trim())}.`);
+  if (p.receiver) {
+    L.push(`  receiver: player #${p.receiver.slot} cls${hex2(p.receiver.classId)} at (${p.receiver.x},${p.receiver.y}), inventory ${p.receiver.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",")}`);
+  } else {
+    L.push(`  receiver: could not be matched to a player unit from the battle structs`);
+  }
+  const entries = p.receiver ? p.receiver.items.map((i, k) => `${k}=0x${hex2(i.id)}x${i.uses}`) : [];
+  entries.push(
+    `${entries.length}=${p.newItem !== null ? `0x${hex2(p.newItem)}` : "? — not identifiable from memory; an mgba_screenshot shows its name"} ` +
+    `(the NEW item${p.dropper ? `, dropped by enemy #${p.dropper.slot}` : ""})`,
+  );
+  L.push(`  list entries (menu count ${p.count}, highlight on ${p.index}): ${entries.join(", ")}`);
+  L.push(
+    `  NOTHING has been pressed: every A/Start loop stops here because A on an entry ${p.kind === "send" ? "sends" : "discards"} it at once. ` +
+    `Decide which item is least needed and call fe7_inventory_full(index) — index ${entries.length - 1} ${p.kind === "send" ? "sends the new item away" : "discards the new item"} and leaves the unit's inventory exactly as it is.`,
+  );
+  return L.join("\n");
+}
+
+async function fe7InventoryFull(m: MgbaClient, index: number): Promise<string> {
+  const p = await inventoryFullIfHinted(m, true);
+  if (!p) {
+    const t = await readText(m, 96);
+    return `No inventory-full prompt is up (text buffer ${JSON.stringify(t.trim())}, and no live menu with it). Nothing was pressed.`;
+  }
+  if (!Number.isInteger(index) || index < 0 || index >= p.count) {
+    return `index ${index} is out of range — the prompt lists ${p.count} entries (0-${p.count - 1}). Nothing was pressed.\n${formatInvPrompt(p)}`;
+  }
+  const before = p.receiver ? p.receiver.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",") : "?";
+  if (!(await menuGoTo(m, p.menuAddr, index, p.count))) {
+    return `Could not move the highlight to entry ${index} — the index byte would not settle. Nothing was confirmed.\n${formatInvPrompt(p)}`;
+  }
+  const idx = await readRange(m, p.menuAddr, 1);
+  if (idx[0] !== index) return `Highlight reads ${idx[0]} after moving, not ${index}. Nothing was confirmed.`;
+  await press(m, [{ buttons: ["A"], frames: 4, release_frames: 30 }]);
+  await sleep(800);
+  const still = await inventoryFullIfHinted(m, true);
+  const now = p.receiver ? await readUnit(m, A.playerArray, p.receiver.slot) : null;
+  const after = now ? now.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",") : "?";
+  if (still) {
+    return `Pressed A on entry ${index} but the prompt is STILL up (highlight now ${still.index}). Receiver inventory ${before} -> ${after}. Call fe7_unstick.`;
+  }
+  const chosen = p.receiver && index < p.receiver.items.length
+    ? `entry ${index} (0x${hex2(p.receiver.items[index].id)})`
+    : `entry ${index} (the new item${p.newItem !== null ? ` 0x${hex2(p.newItem)}` : ""})`;
+  return (
+    `Resolved: ${p.kind === "send" ? "sent" : "discarded"} ${chosen}. Receiver #${p.receiver?.slot ?? "?"} inventory ${before} -> ${after}. ` +
+    `The game has resumed — if this was the enemy phase call fe7_wait, otherwise fe7_state.`
+  );
+}
+
+// ── Weapon choice for an attack ─────────────────────────────────────────────
+//
+// fe7_act(attack) and fe7_forecast always swung the EQUIPPED weapon, because the
+// step after choosing Attack was a blind A on whatever the weapon list had
+// highlighted — entry 0, the equipped one. That silently hid Eliwood's Rapier
+// behind his Iron Sword against a Knight on Ch.20 (4x2 instead of a one-round
+// kill) and Marcus's Silver Lance behind a Hand Axe against the boss. The list's
+// entries carry no readable item id, so the pick is confirmed BY EFFECT instead:
+// once target select opens, the game's own BattleUnit for the actor names the
+// weapon it will use (gBattleActor +0x4A, already decoded as BattleSide.weaponId).
+
+/**
+ * Inventory slot indices of weapons the unit can actually wield — has a rank in —
+ * in inventory order, which is the Attack list's order (the game additionally
+ * leaves out any weapon that has no target in range from the chosen tile).
+ */
+async function usableWeaponSlots(m: MgbaClient, u: Unit): Promise<number[]> {
+  const out: number[] = [];
+  for (let i = 0; i < u.items.length; i++) {
+    const t = await itemType(m, u.items[i].id);
+    if (t === WTYPE_STAFF || t > 7) continue;
+    if (u.ranks[t] === 0) continue;
+    out.push(i);
+  }
+  return out;
+}
+
+/**
+ * weapon_slot pre-flight: everything about the request that is knowable from the
+ * unit's own record, so a doomed pick is refused before the unit takes a step.
+ */
+async function weaponSlotPreflight(
+  m: MgbaClient, u: Unit, wantSlot: number,
+): Promise<{ ok: true; id: number; min: number; max: number; listIndex: number } | { ok: false; reason: string }> {
+  const inv = u.items.map((i) => hex2(i.id)).join(",") || "empty";
+  if (!Number.isInteger(wantSlot) || wantSlot < 0 || wantSlot >= u.items.length) {
+    return { ok: false, reason: `weapon_slot ${wantSlot} is out of range — unit #${u.slot} carries ${u.items.length} item(s) (${inv})` };
+  }
+  const id = u.items[wantSlot].id;
+  const t = await itemType(m, id);
+  if (t === WTYPE_STAFF || t > 7) {
+    return {
+      ok: false,
+      reason: `weapon_slot ${wantSlot} holds 0x${hex2(id)}, which is ${t === WTYPE_STAFF ? "a staff" : "not a weapon"} (item type ${t})`,
+    };
+  }
+  if (u.ranks[t] === 0) {
+    return {
+      ok: false,
+      reason:
+        `weapon_slot ${wantSlot} holds 0x${hex2(id)} (weapon type ${t}) but unit #${u.slot}'s rank in that type is 0 — ` +
+        `its class cannot wield it, so the Attack list will never offer it`,
+    };
+  }
+  const usable = await usableWeaponSlots(m, u);
+  const r = await itemRange(m, id);
+  return { ok: true, id, min: r.min, max: r.max, listIndex: usable.indexOf(wantSlot) };
+}
+
+/**
+ * Make the requested weapon the one the attack will use.
+ *
+ * Call this right after the A that chose Attack on the action menu. The game then
+ * shows either the WEAPON LIST (more than one usable weapon) or, with exactly one,
+ * goes straight to target select. Entries have no readable item id, so each pick
+ * is confirmed by effect: A on an entry opens target select, the actor BattleUnit
+ * then names the weapon, and a wrong one is backed out with a single B — which
+ * returns to the list — before the next entry is tried. Nothing here commits: the
+ * attack still needs one more A after target select, and the caller owns that.
+ *
+ * SIDE EFFECT: the game re-equips a weapon the moment it is picked from the list,
+ * and backing out with B does not undo it. Every entry this walks past therefore
+ * ends up equipped in turn, and the LAST pick stays equipped even if the whole
+ * flow is unwound. Verified live: a Rapier forecast left the Rapier in slot 0.
+ *
+ * `expectIndex` is the weapon's position among the wieldable weapons in inventory
+ * order — the list's order minus anything the game filtered out for range — so it
+ * is tried first, then every other entry, so a filtered list still resolves.
+ */
+async function selectAttackWeapon(
+  m: MgbaClient, wantId: number, expectIndex: number,
+): Promise<{ ok: true; how: string } | { ok: false; reason: string }> {
+  await sleep(200);
+  if (await forecastLive(m)) {
+    // No list at all: the game found one usable weapon and went straight to targets.
+    const f = await readForecast(m);
+    if (f.actor.weaponId === wantId) return { ok: true, how: "the only usable weapon here, no list shown" };
+    return {
+      ok: false,
+      reason: `the game showed no weapon list — its only usable weapon from this tile is 0x${hex2(f.actor.weaponId)}, not 0x${hex2(wantId)}`,
+    };
+  }
+  const menu = await locateMenu(m);
+  if (!menu) {
+    // A ONE-ENTRY weapon list. Seen live: Hector at range 2 with only the Hand
+    // Axe reaching — the game still shows the list, but with a single entry, and
+    // locateMenu cannot see it because its Down probe changes nothing on a
+    // one-entry menu. The one A that selects that entry is the same second A the
+    // weapon-less flow has always pressed here; it can only open target select,
+    // never commit. Confirm by effect exactly as for a walked list.
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    await sleep(240);
+    if (!(await forecastLive(m))) {
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+      await sleep(160);
+      return { ok: false, reason: "Attack was chosen but neither a weapon list nor target select could be located, and one more A did not open target select either" };
+    }
+    const f = await readForecast(m);
+    if (f.actor.weaponId === wantId) return { ok: true, how: "single-entry weapon list" };
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+    await sleep(160);
+    return {
+      ok: false,
+      reason: `the weapon list had a single entry and it is 0x${hex2(f.actor.weaponId)}, not 0x${hex2(wantId)} — the only weapon with a target in range from this tile`,
+    };
+  }
+  let menuAddr = menu.addr;
+  const order = [expectIndex, ...Array.from({ length: menu.count }, (_, i) => i)]
+    .filter((v, i, a) => v >= 0 && v < menu.count && a.indexOf(v) === i);
+  const seen: string[] = [];
+  for (const idx of order) {
+    if (!(await menuGoTo(m, menuAddr, idx, menu.count))) { seen.push(`${idx}=unreachable`); continue; }
+    await clearForecastGate(m);
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    await sleep(220);
+    if (!(await forecastLive(m))) {
+      // A on a weapon entry must open target select. If it did not, this is not
+      // the weapon list, and pressing on would be blind — back out of whatever opened.
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+      await sleep(160);
+      seen.push(`${idx}=no-forecast`);
+      continue;
+    }
+    const f = await readForecast(m);
+    seen.push(`${idx}=0x${hex2(f.actor.weaponId)}`);
+    if (f.actor.weaponId === wantId) return { ok: true, how: `weapon list entry ${idx} of ${menu.count}` };
+    // Wrong weapon: one B returns to the list. Confirm the same struct is live
+    // again before the next pick, re-locating it if the count byte moved.
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+    await sleep(180);
+    const b = await readRange(m, menuAddr - 1, 1);
+    if (b[0] !== menu.count) {
+      const again = await locateMenu(m);
+      if (!again || again.count !== menu.count) {
+        return { ok: false, reason: `lost the weapon list after backing out of entry ${idx} (entries so far: ${seen.join(", ")})` };
+      }
+      menuAddr = again.addr;
+    }
+  }
+  return {
+    ok: false,
+    reason:
+      `0x${hex2(wantId)} is not in the Attack list from this tile — its ${menu.count} entries resolved to ${seen.join(", ")}. ` +
+      `The game leaves a weapon off the list when it has no target in range`,
+  };
 }
 
 // ── Combat forecast ────────────────────────────────────────────────────────
@@ -1402,13 +1766,18 @@ async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
 
   L.push(`ENEMIES:`);
   for (const u of foes) {
+    // DROPS = the unit-state drop bit is set, so killing it hands its LAST item
+    // to the killer. A killer already holding 5 items then halts the game on the
+    // inventory-full prompt (see fe7_inventory_full), so this is worth knowing
+    // before choosing who takes the kill.
+    const drop = dropTag(u);
     if (brief) {
-      L.push(`  #${u.slot} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}`);
+      L.push(`  #${u.slot} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}${drop}`);
     } else {
       const items = u.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",");
       L.push(
         `  #${u.slot} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
-        ` S${u.str} K${u.skl} P${u.spd} D${u.def} R${u.res}` + (items ? ` [${items}]` : ""),
+        ` S${u.str} K${u.skl} P${u.spd} D${u.def} R${u.res}` + (items ? ` [${items}]` : "") + drop,
       );
     }
   }
@@ -1699,6 +2068,7 @@ async function fe7Act(
   targetSlot: number | null,
   itemSlot: number | null,
   targetFaction: string,
+  weaponSlot: number | null = null,
 ): Promise<ActResult> {
   // PRE-FLIGHT. These refusals depend only on the unit's own record, so finding
   // them out AFTER prologue() has already selected the unit and walked it to the
@@ -1746,6 +2116,38 @@ async function fe7Act(
             `Unit #${slot} carries no usable consumable — inventory is ` +
             `${pre.items.map((i) => hex2(i.id)).join(",") || "empty"}, all weapons or staves. There is nothing to ` +
             `'use' on itself. Nothing was moved or pressed; it is unspent at (${pre.x},${pre.y}).`,
+        };
+      }
+    }
+  }
+
+  // weapon_slot is knowable in full before moving: the slot, its type, the unit's
+  // rank in it, and — since the destination is given — whether it reaches anything.
+  if (action === "attack" && weaponSlot !== null) {
+    const pre = await readUnit(m, A.playerArray, slot);
+    if (pre) {
+      const where = `Nothing was moved or pressed; unit #${slot} is unspent at (${pre.x},${pre.y}).`;
+      const w = await weaponSlotPreflight(m, pre, weaponSlot);
+      if (!w.ok) return { text: `${w.reason}. ${where}` };
+      const foes = await readArray(m, A.enemyArray);
+      const reach = (e: Unit) => {
+        const d = Math.abs(e.x - destX) + Math.abs(e.y - destY);
+        return d >= w.min && d <= w.max;
+      };
+      if (targetSlot !== null) {
+        const t = bySlot(foes, targetSlot);
+        if (!t || t.dead) return { text: `No living enemy in slot ${targetSlot}. ${where}` };
+        if (!reach(t)) {
+          const d = Math.abs(t.x - destX) + Math.abs(t.y - destY);
+          return {
+            text:
+              `weapon_slot ${weaponSlot} (0x${hex2(w.id)}) reaches ${w.min}-${w.max}, but enemy #${targetSlot} at (${t.x},${t.y}) ` +
+              `is ${d} from (${destX},${destY}). ${where}`,
+          };
+        }
+      } else if (!foes.some((e) => !e.dead && reach(e))) {
+        return {
+          text: `weapon_slot ${weaponSlot} (0x${hex2(w.id)}) reaches ${w.min}-${w.max} and no enemy is within that of (${destX},${destY}). ${where}`,
         };
       }
     }
@@ -1928,12 +2330,24 @@ async function fe7Act(
     // axe, bow and tome attack and made the unit Wait instead — wasting the turn
     // and reporting "no enemy is adjacent", which was true and irrelevant.
     let minR = 99, maxR = 0;
-    for (const it of u.items) {
-      const t = await itemType(m, it.id);
-      if (t === WTYPE_STAFF || t === 9 || u.ranks[t] === 0) continue;
-      const r = await itemRange(m, it.id);
-      if (r.max > maxR) maxR = r.max;
-      if (r.min < minR) minR = r.min;
+    let wantWeapon: { id: number; listIndex: number } | null = null;
+    if (weaponSlot !== null) {
+      // Re-derived from the post-move record (the pre-flight above used the
+      // pre-move one); the range that matters is this weapon's alone.
+      const w = await weaponSlotPreflight(m, u, weaponSlot);
+      if (!w.ok) {
+        const restored = await unwind(m, slot, startX, startY);
+        return { text: `${w.reason}. Nothing was committed; unit #${slot} is ${restored ? `unwound to (${startX},${startY}) and unspent.` : "unspent, but could not be fully unwound — check fe7_state."}` };
+      }
+      minR = w.min; maxR = w.max; wantWeapon = { id: w.id, listIndex: w.listIndex };
+    } else {
+      for (const it of u.items) {
+        const t = await itemType(m, it.id);
+        if (t === WTYPE_STAFF || t === 9 || u.ranks[t] === 0) continue;
+        const r = await itemRange(m, it.id);
+        if (r.max > maxR) maxR = r.max;
+        if (r.min < minR) minR = r.min;
+      }
     }
     const adj = maxR === 0 ? [] : enemies.filter((e) => {
       if (e.dead) return false;
@@ -1971,9 +2385,29 @@ async function fe7Act(
     // time and stop the moment the unit reports spent.
     let picked = false;
     let forecast = "";
+    let weaponHow = "";
     await clearForecastGate(m);
     for (let step = 0; step < 4; step++) {
       await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+
+      // The first A chose Attack. With a weapon requested, resolve the weapon list
+      // NOW, confirmed against the actor BattleUnit, before any target is picked.
+      // A refused pick unwinds with the unit unspent — never a Wait, never a swing.
+      if (step === 0 && wantWeapon && !picked) {
+        const sel = await selectAttackWeapon(m, wantWeapon.id, wantWeapon.listIndex);
+        if (!sel.ok) {
+          const restored = await unwind(m, slot, startX, startY);
+          return {
+            text:
+              `Attack with weapon_slot ${weaponSlot} (0x${hex2(wantWeapon.id)}) was refused: ${sel.reason}. ` +
+              `Nothing was committed and NO Wait was issued; unit #${slot} is ` +
+              (restored
+                ? `UNSPENT and back at (${startX},${startY}), free to do something else this turn.`
+                : `unspent, but could not be fully unwound — check fe7_state before acting.`),
+          };
+        }
+        weaponHow = sel.how;
+      }
 
       // The forecast pair is populated exactly when target select is up, so it
       // tells us we have arrived without counting menu steps. Target choice used
@@ -2044,11 +2478,12 @@ async function fe7Act(
     // unspent one ends the phase, and the new turn clears has-acted.
     const clk0 = await phaseClock(m);
     let endedPhase = false;
-    const done = await skipWhile(m, async () => {
+    const sk = await skipCombat(m, async () => {
       const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
       if (c.phase !== clk0.phase || c.turn !== clk0.turn) { endedPhase = true; return true; }
       return !!v && v.acted;
     }, 45000);
+    const done = sk.ok;
 
     const after = await readArray(m, A.enemyArray);
     const self = await readUnit(m, A.playerArray, slot);
@@ -2064,9 +2499,22 @@ async function fe7Act(
       const now = bySlot(after, b.slot);
       return !now || now.hp !== b.hp;
     });
+    if (sk.prompt) {
+      return {
+        text:
+          `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp}. ` +
+          `The fight resolved and the game is now HALTED on the inventory-full prompt; the unit's turn completes once it is answered.${forecast}\n` +
+          formatInvPrompt(sk.prompt),
+      };
+    }
     return {
       text: done
-        ? `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp}, ` +
+        ? `Unit #${slot} attacked from (${destX},${destY}). Enemy HP: ${deltas}. Self: HP ${self?.hp}/${self?.maxHp},` +
+          (wantWeapon
+            ? ` weapon 0x${hex2(wantWeapon.id)} via ${weaponHow}; the game re-equipped it, inventory is now ` +
+              `${self?.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",") ?? "?"} (slot numbers shifted).`
+            : "") +
+          ` ` +
           (endedPhase
             ? `and it was the last unspent unit, so the player phase ended.${forecast}`
             : `+0x0C=0x${hex2((self?.flags ?? 0) & 0xff)}.${forecast}`)
@@ -2372,10 +2820,21 @@ async function fe7Forecast(
   destX: number,
   destY: number,
   targetSlot: number | null,
+  weaponSlot: number | null = null,
 ): Promise<string> {
   const pro = await prologue(m, slot, destX, destY);
   if (!pro.ok) return pro.text;
   const { u, enemies, startX, startY } = pro;
+
+  let want: { id: number; listIndex: number } | null = null;
+  if (weaponSlot !== null) {
+    const w = await weaponSlotPreflight(m, u, weaponSlot);
+    if (!w.ok) {
+      await unwind(m, slot, startX, startY);
+      return `${w.reason}. Nothing changed; unit #${slot} is back at (${startX},${startY}) and unspent.`;
+    }
+    want = { id: w.id, listIndex: w.listIndex };
+  }
 
   const menu = await locateMenu(m);
   if (!menu) {
@@ -2383,8 +2842,24 @@ async function fe7Forecast(
     return `Unit #${slot} reached (${destX},${destY}) but the action menu could not be located. Nothing changed.`;
   }
 
+  // With a weapon requested, find Attack by its ROM command pointer instead of
+  // probing entries in order: the probe's blind second A inside the Item list
+  // would otherwise land on an item sub-menu, and the weapon-list walk below
+  // must only ever run inside the real weapon list.
+  let cands: number[] = Array.from({ length: menu.count - 1 }, (_, i) => i);
+  if (want) {
+    const cmds = await menuEntryCmds(m, menu.addr, menu.count);
+    const at = cmds.findIndex((c) => c === MENU_CMD.attack || c === MENU_CMD.attack2);
+    if (at < 0) {
+      await unwind(m, slot, startX, startY);
+      return `No Attack entry on unit #${slot}'s action menu at (${destX},${destY}) — it holds [${cmds.map(cmdName).join(", ")}]. Nothing changed.`;
+    }
+    cands = [at];
+  }
+  let weaponNote = "";
+
   const tried: string[] = [];
-  for (let cand = 0; cand < menu.count - 1; cand++) {
+  for (const cand of cands) {
     if (!(await menuGoTo(m, menu.addr, cand, menu.count))) continue;
     await clearForecastGate(m);
     await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
@@ -2398,22 +2873,31 @@ async function fe7Forecast(
       continue;
     }
 
-    // Attack opens a weapon list; one more A reaches target select. Both presses
-    // are safe — only a third commits.
-    let live = await forecastLive(m);
-    if (!live) {
-      await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
-      await sleep(220);
-      live = await forecastLive(m);
-    }
-    if (!live) {
-      tried.push(`${cand}=no-forecast`);
-      await press(m, [
-        { buttons: ["B"], frames: 4, release_frames: 22 },
-        { buttons: ["B"], frames: 4, release_frames: 22 },
-      ]);
-      await sleep(160);
-      continue;
+    if (want) {
+      const sel = await selectAttackWeapon(m, want.id, want.listIndex);
+      if (!sel.ok) {
+        await unwind(m, slot, startX, startY);
+        return `Forecast with weapon_slot ${weaponSlot} (0x${hex2(want.id)}) was refused: ${sel.reason}. Nothing changed; unit #${slot} is back at (${startX},${startY}) and unspent.`;
+      }
+      weaponNote = ` with 0x${hex2(want.id)} (${sel.how})`;
+    } else {
+      // Attack opens a weapon list; one more A reaches target select. Both presses
+      // are safe — only a third commits.
+      let live = await forecastLive(m);
+      if (!live) {
+        await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+        await sleep(220);
+        live = await forecastLive(m);
+      }
+      if (!live) {
+        tried.push(`${cand}=no-forecast`);
+        await press(m, [
+          { buttons: ["B"], frames: 4, release_frames: 22 },
+          { buttons: ["B"], frames: 4, release_frames: 22 },
+        ]);
+        await sleep(160);
+        continue;
+      }
     }
 
     if (targetSlot !== null) {
@@ -2442,14 +2926,21 @@ async function fe7Forecast(
     ]);
 
     const restored = await unwind(m, slot, startX, startY);
+    // Picking from the weapon list re-equips immediately, and unwinding does not
+    // undo it (verified live). Say so, and print the order the caller will now see.
+    const after = want ? await readUnit(m, A.playerArray, slot) : null;
     const lines = [
-      `Forecast — unit #${slot} cls${hex2(u.classId)} attacking from (${destX},${destY})` +
+      `Forecast — unit #${slot} cls${hex2(u.classId)} attacking from (${destX},${destY})${weaponNote}` +
         (foe ? ` vs enemy #${foe.slot} cls${hex2(foe.classId)} at (${foe.x},${foe.y}) HP ${foe.hp}/${foe.maxHp}`
              : t ? ` vs the unit on (${t.x},${t.y}) (not matched to an enemy slot)` : ""),
       `  ${formatSide("attacker", f.actor, f.target, aV)}`,
       `  ${formatSide("defender", f.target, f.actor, dV)}`,
       `  projected HP after: attacker ${f.actor.projHp}, defender ${f.target.projHp}` +
         `  <- a deterministic every-blow-lands projection, NOT a prediction; real combat rolls hit and crit`,
+      ...(after && want
+        ? [`  NOTE: picking 0x${hex2(want.id)} from the list RE-EQUIPPED it even though nothing was committed — inventory is now ` +
+           `${after.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",")}; slot numbers have shifted, so re-read fe7_state.`]
+        : []),
       restored
         ? `  (unit returned to (${startX},${startY}), unselected and unspent — nothing was committed)`
         : `  WARNING: could not fully unwind. Check fe7_state before acting.`,
@@ -2697,6 +3188,15 @@ async function fe7Unstick(m: MgbaClient): Promise<{ text: string; png?: string }
   const textBuf = await readText(m);
   L.push(`       text buffer: ${JSON.stringify(textBuf)}`);
 
+  // The one screen where the usual advice ("press A / Start") would DO something
+  // irreversible: A on the inventory-full list sends that item. Name it first.
+  const inv = await inventoryFullIfHinted(m, true);
+  if (inv) {
+    L.push("");
+    L.push(`VERDICT  ${formatInvPrompt(inv)}`);
+    return { text: L.join("\n") };
+  }
+
   // ── Input-signature probe ────────────────────────────────────────────────
   // Press away from the map edge so a blocked cursor is never mistaken for
   // swallowed input, then press back so the probe restores whatever it moved —
@@ -2864,9 +3364,10 @@ async function cursorResponds(m: MgbaClient): Promise<boolean> {
 
 async function awaitPlayerPhase(
   m: MgbaClient, maxMs: number,
-): Promise<{ returned: boolean; phase: number; turn: number; inputFree: boolean; cleared: number }> {
+): Promise<{ returned: boolean; phase: number; turn: number; inputFree: boolean; cleared: number; prompt?: InvPrompt }> {
   const deadline = Date.now() + maxMs;
   let beat = 0;
+  const risky = await dropRisk(m);
   for (;;) {
     const b = await readRange(m, A.phase, 2);
     if (b[0] === 0x00) {
@@ -2881,9 +3382,22 @@ async function awaitPlayerPhase(
       // B does not clear dialogue; Start does, a whole sequence per press (one
       // press cleared that cutscene). So keep skipping until the cursor actually
       // moves, which is the only checkable definition of "the turn is yours".
+      // SETTLE FIRST. The flip lands while the "Player Phase" banner is still
+      // animating, and during the banner the cursor probe fails even though
+      // nothing is wrong. Probing immediately turned that false negative into
+      // Start/A/Up presses aimed at a map that goes live mid-sequence: A opened
+      // the field menu on an empty tile, the probe's Up walked the highlight
+      // End -> Suspend, and the next A suspended the game to the title screen.
+      // Seen twice on Ch.20 (2026-09-12). Two and a half seconds outlasts the
+      // banner; a real cutscene is still caught by the probe loop below.
+      await sleep(2500);
       let cleared = 0;
       let free = await cursorResponds(m);
       while (!free && cleared < 8 && Date.now() < deadline) {
+        // An inventory-full prompt is one thing that holds the turn open, and A
+        // on it sends an item. Hand it back instead of pressing through it.
+        const pr = await inventoryFullIfHinted(m, risky);
+        if (pr) return { returned: true, phase: 0x00, turn: b[1], inputFree: false, cleared, prompt: pr };
         // Alternate here too: what is holding the turn open may be a cutscene
         // (Start) or a lingering quote box (A). Every press is followed by the
         // cursor test, so this stops the moment the map is actually yours.
@@ -2903,6 +3417,10 @@ async function awaitPlayerPhase(
       await press(m, [{ buttons: ["B"], frames: 4, release_frames: 14 }]);
       return { returned: false, phase: b[0], turn: b[1], inputFree: false, cleared: 0 };
     }
+    // A drop into a full inventory halts the enemy phase on an item list where A
+    // sends the highlighted item to the convoy. Never press through it.
+    const pr = await inventoryFullIfHinted(m, risky);
+    if (pr) return { returned: false, phase: b[0], turn: b[1], inputFree: false, cleared: 0, prompt: pr };
     await press(m, [{ buttons: [beat++ % 2 === 0 ? "A" : "Start"], frames: 4, release_frames: 12 }]);
     await sleep(1100);
   }
@@ -3087,6 +3605,9 @@ async function fe7Wait(m: MgbaClient, timeoutMs: number): Promise<string> {
 
   const r = await awaitPlayerPhase(m, timeoutMs);
   const summary = await battlefieldSummary(m);
+  if (r.prompt) {
+    return `WAITING HALTED on turn ${r.turn} (${PHASE_NAME[r.phase] ?? `0x${hex2(r.phase)}`} phase) — the game is stuck on a prompt that needs a decision, not a button:\n${formatInvPrompt(r.prompt)}\n${summary}`;
+  }
   if (r.returned) {
     const how = r.cleared ? ` (cleared ${r.cleared} event sequence${r.cleared === 1 ? "" : "s"} with Start)` : "";
     const now = await takeSnap(m);
@@ -3212,6 +3733,9 @@ async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
   // returned nothing useful. End the turn, glance at the result, hand off.
   const r = await awaitPlayerPhase(m, timeoutMs);
   const summary = await battlefieldSummary(m);
+  if (r.prompt) {
+    return `WAITING HALTED on turn ${r.turn} (${PHASE_NAME[r.phase] ?? `0x${hex2(r.phase)}`} phase) — the game is stuck on a prompt that needs a decision, not a button:\n${formatInvPrompt(r.prompt)}\n${summary}`;
+  }
 
   if (r.returned) {
     const now = await takeSnap(m);
@@ -3538,7 +4062,7 @@ export const FE7_TOOLS: Tool[] = [
           enum: ["wait", "attack", "staff", "item", "seize", "visit", "door", "chest", "ride", "dismount", "status"],
           description:
             "'wait' ends the unit's turn on the destination tile, picked by wrapping the action menu UP to its last entry. That Up is MENU navigation, not a map input: it is verified by re-reading the cursor, because with no menu open it walks the map instead and the A behind it lands on the board. Commit is confirmed by the TURN CLOCK, not by the has-acted flag — if this is the last unspent unit its Wait ends the phase and the new turn clears that flag, which is success, not failure. " +
-            "'attack' picks Attack and confirms against a target — pass target_slot to choose which enemy and have the choice VERIFIED before swinging. " +
+            "'attack' picks Attack and confirms against a target — pass target_slot to choose which enemy and have the choice VERIFIED before swinging. Pass weapon_slot to swing a specific inventory weapon (the Rapier instead of the equipped Iron Sword); without it the EQUIPPED weapon — inventory slot 0 — is always the one used. " +
             "'staff' heals with a staff: requires target_slot, and item_slot if the unit carries more than one staff. " +
             "'item' uses an item on the unit itself (a vulnerary); item_slot picks which, defaulting to the first. " +
             "'seize' takes a gate or throne with a lord, completing a Seize chapter. The Seize entry is located by READING the menu — each entry's struct carries a ROM pointer identifying its command — so it never presses A on an entry it cannot name. If no Seize entry exists it reports the whole menu's contents and backs out having pressed nothing. " +
@@ -3563,6 +4087,14 @@ export const FE7_TOOLS: Tool[] = [
           type: "number",
           description: "DEPRECATED fallback for action='attack': blind Right presses to cycle targets, used only when target_slot is omitted. Prefer target_slot, which is verified.",
         },
+        weapon_slot: {
+          type: "number",
+          description:
+            "For action='attack': inventory slot (0-based, as listed by fe7_state) of the weapon to attack with. Omit to use the equipped weapon (slot 0). " +
+            "Refused BEFORE the unit moves if the slot is not a weapon, the class has rank 0 in its type, or its range cannot reach the target from (x,y). " +
+            "The pick is CONFIRMED BY EFFECT: the game's weapon list is walked entry by entry and the actor BattleUnit is read at target select to prove which weapon is loaded; a wrong entry is backed out with B and the next tried, and if the weapon is not offered (no target in its range) the whole attack is unwound with the unit unspent. " +
+            "NOTE: choosing a weapon this way makes the game RE-EQUIP it, so the unit's inventory order changes — the result names the new order, and later slot numbers must come from a fresh fe7_state.",
+        },
       },
       required: ["slot", "x", "y", "action"],
     },
@@ -3584,6 +4116,7 @@ export const FE7_TOOLS: Tool[] = [
         x:           { type: "number", description: "Tile x to attack from. Use the unit's current x to forecast without moving." },
         y:           { type: "number", description: "Tile y to attack from." },
         target_slot: { type: "number", description: "Enemy slot to forecast against. Omit to take the game's default target; the unit actually selected is always reported back." },
+        weapon_slot: { type: "number", description: "Inventory slot (0-based, from fe7_state) of the weapon to forecast with. Omit for the equipped weapon (slot 0). Same rules and confirm-by-effect as fe7_act's weapon_slot; the forecast header names the weapon actually loaded. Nothing is committed and the unit is unwound, BUT the game re-equips a weapon the moment it is picked from the list, so a forecast with weapon_slot DOES change the inventory order — the chosen weapon becomes slot 0 (verified: Eliwood 01,03,09 became 09,01,03 after a Rapier forecast). The result prints the new order; re-read fe7_state before trusting slot numbers again. This also means a forecast is a cheap way to EQUIP a weapon without spending the turn." },
       },
       required: ["slot", "x", "y"],
     },
@@ -3596,6 +4129,24 @@ export const FE7_TOOLS: Tool[] = [
   // a partner-select step with a readable highlight. Rather than ship a tool that
   // burns calls and returns nothing, this stays unregistered until the flow is
   // re-derived. Everything else here is tested and working.
+  {
+    name: "fe7_inventory_full",
+    description:
+      "PURPOSE: Answer the 'Your inventory is full — send an item to Merlinus' (or discard) prompt that HALTS the game when a unit already holding 5 items picks up a dropped one. " +
+      "USAGE: Only after fe7_act, fe7_wait, fe7_end_turn or fe7_unstick printed INVENTORY FULL PROMPT with the list of entries. Decide which item is least needed and pass its list index. The last entry is the new item; choosing it leaves the unit's inventory exactly as it was. Enemies whose kill will trigger this are marked DROPS in fe7_state. " +
+      "BEHAVIOR: Drives input. Refuses, pressing nothing, unless the prompt is verified live: the text buffer names it AND a menu whose index moves is open. Moves the highlight by reading the menu's index byte, presses A once (A on an entry sends it at once, with no confirmation), then confirms by effect from the receiver's live inventory. " +
+      "RETURNS: What was sent or discarded and the receiver's inventory before -> after, or why nothing was pressed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        index: {
+          type: "number",
+          description: "0-based entry in the prompt's list as printed: entries 0-4 are the unit's current items in inventory order, the last entry is the dropped item.",
+        },
+      },
+      required: ["index"],
+    },
+  },
   {
     name: "fe7_unstick",
     description:
@@ -3620,8 +4171,8 @@ export const FE7_TOOLS: Tool[] = [
       properties: {
         kind: {
           type: "string",
-          enum: ["missing_action", "too_coarse", "workaround", "confusing", "wrong_result", "other"],
-          description: "'missing_action' — you wanted to do something with no tool for it. 'too_coarse' — a tool exists but cannot express what you needed. 'workaround' — you got there, but awkwardly. 'confusing' — you could not tell what was happening. 'wrong_result' — a tool reported something that turned out to be false.",
+          enum: ["missing_action", "too_coarse", "workaround", "confusing", "wrong_result", "screenshot", "other"],
+          description: "'missing_action' — you wanted to do something with no tool for it. 'too_coarse' — a tool exists but cannot express what you needed. 'workaround' — you got there, but awkwardly. 'confusing' — you could not tell what was happening. 'wrong_result' — a tool reported something that turned out to be false. 'screenshot' — you took an mgba_screenshot; give the saved path, the turn, why you took it and what it showed, so the PNG can be matched to the moment afterwards.",
         },
         detail: { type: "string", description: "What happened, concretely — units, tiles, and what you were trying to achieve. Specific beats tidy." },
         wanted: { type: "string", description: "What the tool layer should have let you do instead. A rough sketch of the call you wish existed is ideal." },
@@ -3651,7 +4202,7 @@ export const FE7_TOOLS: Tool[] = [
     description:
       "PURPOSE: Wait for the player phase to come back, in a resumable chunk, while alternating A and Start to clear any dialogue or cutscene that would otherwise stall it forever. " +
       "USAGE: Call after fe7_end_turn reports the enemy phase is still running, and call it again as many times as needed — each call is a checkpoint that reports what it found. Also safe to call any time you suspect the game is sitting on an event and swallowing input. " +
-      "BEHAVIOR: Drives input. Polls the phase byte and alternates A and Start about once a second until the player phase returns or the timeout expires. BOTH are needed and they clear different screens: Start skips an event cutscene whole, while a battle or death quote ignores Start entirely and advances only on A. Both are safe during the enemy phase because the game ignores map input then. It does not try to speed the enemy phase itself up; the only way to do that is holding A down, which is blind input this layer exists to avoid. The phase byte flips BEFORE an arrival cutscene finishes, so on the flip it keeps clearing until the cursor actually responds, then taps B — which closes a minimap a late Start opened or a field menu a late A opened, and does nothing at all otherwise. " +
+      "BEHAVIOR: Drives input. Polls the phase byte and alternates A and Start about once a second until the player phase returns or the timeout expires. BOTH are needed and they clear different screens: Start skips an event cutscene whole, while a battle or death quote ignores Start entirely and advances only on A. Both are safe during the enemy phase because the game ignores map input then. It does not try to speed the enemy phase itself up; the only way to do that is holding A down, which is blind input this layer exists to avoid. The phase byte flips BEFORE an arrival cutscene finishes and before the Player Phase banner ends, so on the flip it first waits 2.5s for the banner to settle (probing during it once walked the field menu onto Suspend), then keeps clearing until the cursor actually responds, then taps B — which closes a minimap a late Start opened or a field menu a late A opened, and does nothing at all otherwise. " +
       "RETURNS: Whether the player phase resumed and on which turn, plus a battlefield summary naming any fallen units and listing wounded survivors. " +
       "If it times out it says WHY it is worth waiting again: it fingerprints every unit's position and HP across the window, so 'units did move, call again' and 'nothing on the board changed at all, stop and call fe7_unstick' are different answers. " +
       "It also checks two loss conditions it can prove from the unit arrays — every deployed player dead, or the greens going to zero on a protect chapter — because the phase byte never leaves 0x80 once the chapter is over, so polling alone would wait forever. The game's own game-over flag is not located yet, so that check is reported as a strong inference, not proof.",
@@ -3740,6 +4291,7 @@ async function dispatchFe7(
             p.target_slot === undefined ? null : Number(p.target_slot),
             p.item_slot === undefined ? null : Number(p.item_slot),
             p.target_faction === undefined ? "player" : String(p.target_faction),
+            p.weapon_slot === undefined ? null : Number(p.weapon_slot),
           )
         ).text,
       );
@@ -3749,6 +4301,7 @@ async function dispatchFe7(
         await fe7Forecast(
           m, Number(p.slot), Number(p.x), Number(p.y),
           p.target_slot === undefined ? null : Number(p.target_slot),
+          p.weapon_slot === undefined ? null : Number(p.weapon_slot),
         ),
       );
 
@@ -3768,6 +4321,9 @@ async function dispatchFe7(
 
     case "fe7_wait":
       return wrap(await fe7Wait(m, Number(p.timeout_ms ?? 90000)));
+
+    case "fe7_inventory_full":
+      return wrap(await fe7InventoryFull(m, Number(p.index)));
 
     default:
       return null;
