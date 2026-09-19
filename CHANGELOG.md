@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`reason` parameter on `fe7_act` and `fe7_end_turn`** (required). One sentence
+  from the model explaining the action it is about to commit, or why the turn is
+  ready to end. Not acted on; recorded verbatim in the run log's `params` so the
+  human reviewing a run can see the intent behind each call. Both tools refuse
+  to press anything when it is missing or blank.
+
 ## [0.3.3] - 2026-06-11
 
 Release-plumbing only. No functional change from 0.3.2 — this version exists

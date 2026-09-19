@@ -4095,8 +4095,13 @@ export const FE7_TOOLS: Tool[] = [
             "The pick is CONFIRMED BY EFFECT: the game's weapon list is walked entry by entry and the actor BattleUnit is read at target select to prove which weapon is loaded; a wrong entry is backed out with B and the next tried, and if the weapon is not offered (no target in its range) the whole attack is unwound with the unit unspent. " +
             "NOTE: choosing a weapon this way makes the game RE-EQUIP it, so the unit's inventory order changes — the result names the new order, and later slot numbers must come from a fresh fe7_state.",
         },
+        reason: {
+          type: "string",
+          description:
+            "REQUIRED. One sentence, in plain words, saying why THIS unit is taking THIS action at THIS tile — the threat it answers, the kill it sets up, the tile it holds, or the heal it delivers. Written for the human reviewing the run log afterwards, who sees only the calls and their results, not your reasoning. The tool does not act on it, but it refuses to press anything when it is missing or blank.",
+        },
       },
-      required: ["slot", "x", "y", "action"],
+      required: ["slot", "x", "y", "action", "reason"],
     },
   },
   {
@@ -4194,7 +4199,13 @@ export const FE7_TOOLS: Tool[] = [
           type: "number",
           description: "How long to wait for the player phase before handing off to fe7_wait (default 12000). Kept short deliberately: any single tool call is force-backgrounded around 120s, and a full enemy phase often runs longer, so waiting here just burns the budget for no information.",
         },
+        reason: {
+          type: "string",
+          description:
+            "REQUIRED. One sentence saying why the turn is ready to end — which units have acted, which were deliberately left idle and why, and what you expect the enemy phase to do. Written for the human reviewing the run log afterwards. The tool does not act on it, but it refuses to end the turn when it is missing or blank.",
+        },
       },
+      required: ["reason"],
     },
   },
   {
@@ -4217,6 +4228,17 @@ export const FE7_TOOLS: Tool[] = [
     },
   },
 ];
+
+// `reason` is a diary parameter: the model states, in one sentence, why it is doing what
+// it is about to do. Nothing downstream reads it — it is for the human reading the run
+// log, where every call's params are recorded verbatim. It is enforced here because the
+// MCP client does not reliably enforce `required`, and a missing reason is exactly the
+// call a reviewer most wants explained. Refused before anything is pressed.
+function missingReason(tool: string, p: Record<string, unknown>): string | null {
+  const r = typeof p.reason === "string" ? p.reason.trim() : "";
+  if (r.length > 0) return null;
+  return `${tool} needs \`reason\`: one sentence saying why you are doing this. Nothing was pressed; call again with reason set.`;
+}
 
 export async function handleFe7(
   name: string,
@@ -4280,7 +4302,9 @@ async function dispatchFe7(
     case "fe7_reachable":
       return wrap(await fe7Reachable(m, Number(p.slot), p.keep_selected === true));
 
-    case "fe7_act":
+    case "fe7_act": {
+      const noReason = missingReason("fe7_act", p);
+      if (noReason) return wrap(noReason);
       return wrap(
         (
           await fe7Act(
@@ -4295,6 +4319,7 @@ async function dispatchFe7(
           )
         ).text,
       );
+    }
 
     case "fe7_forecast":
       return wrap(
@@ -4316,8 +4341,11 @@ async function dispatchFe7(
       return { content };
     }
 
-    case "fe7_end_turn":
+    case "fe7_end_turn": {
+      const noReason = missingReason("fe7_end_turn", p);
+      if (noReason) return wrap(noReason);
       return wrap(await fe7EndTurn(m, Number(p.timeout_ms ?? 12000)));
+    }
 
     case "fe7_wait":
       return wrap(await fe7Wait(m, Number(p.timeout_ms ?? 90000)));
