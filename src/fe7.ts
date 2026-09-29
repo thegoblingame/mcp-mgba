@@ -94,6 +94,12 @@ const GRID_Y_BOT   = 2;      // ...and two trailing border rows: height = rows -
 const GRID_PROBE   = 2048;   // table + data in ONE read for any observed map
 const CLASS_BASE   = 0x08be015c;
 const CLASS_STRIDE = 0x54;
+// Character (ROM) table: char ID = (charPtr - CHAR_BASE) / CHAR_STRIDE. Verified
+// 2026-09-27 by reading byte +0x04 (the struct's own ID field) of entries
+// 0x00-0x07 and 0x2C-0x2F: every one equals its index. Lyn has TWO entries,
+// 0x03 (Lyn's tale) and 0x2D (main game), sharing name text ID 0x04DE.
+const CHAR_BASE    = 0x08bdce18;
+const CHAR_STRIDE  = 0x34;
 
 const UNREACHABLE = 0xff;
 
@@ -330,6 +336,9 @@ export interface Unit {
   /** Character-struct pointer (+0x00). STABLE identity: array slots get recycled
    *  by reinforcements, so a slot number alone does not identify a unit over time. */
   charPtr: number;
+  /** Character ID, derived from charPtr. Survives promotion (which changes classId)
+   *  and death-compaction (which changes roster). -1 if the pointer is off-table. */
+  charId: number;
   roster: number;
   classId: number;
   level: number;
@@ -355,6 +364,7 @@ function decodeUnit(b: number[], base: number, slot: number, arrayAddr: number):
 
   const classPtr = u32(b, o + 0x04);
   const classId = classPtr > CLASS_BASE ? Math.floor((classPtr - CLASS_BASE) / CLASS_STRIDE) : -1;
+  const charId = charPtr >= CHAR_BASE ? Math.floor((charPtr - CHAR_BASE) / CHAR_STRIDE) : -1;
   const flags = u32(b, o + 0x0c);
   const low = flags & 0xff;
 
@@ -368,6 +378,7 @@ function decodeUnit(b: number[], base: number, slot: number, arrayAddr: number):
     slot,
     addr: arrayAddr + slot * UNIT_STRIDE,
     charPtr,
+    charId,
     roster: b[o + 0x0b],
     classId,
     level: b[o + 0x08],
@@ -389,7 +400,12 @@ function decodeUnit(b: number[], base: number, slot: number, arrayAddr: number):
     // values a spent unit can hold is evidently not fully known.
     acted: (low & 0x02) !== 0,
     selected: (low & 0x01) !== 0,
-    deployed: b[o + 0x10] !== 0xff,
+    // x != 0xFF alone is not enough. Units that have left the party keep the
+    // coordinates of the last map they stood on: in Hector Ch.13 the whole
+    // Lyn's-tale cast read as on the map (one of them on an enemy's tile) with
+    // flags 0x00010009. Bit 3 is the game's own not-deployed flag and bit 16
+    // marks a unit that is away from the party; see RAM.md "Deployment".
+    deployed: b[o + 0x10] !== 0xff && (flags & 0x00010008) === 0,
     dead: b[o + 0x13] === 0,
     items,
     ranks: Array.from({ length: 8 }, (_, i) => b[o + 0x28 + i]),
@@ -1750,12 +1766,17 @@ async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
   L.push(`PLAYERS:`);
   for (const u of live) {
     const st = u.acted ? " ACTED" : "";
+    // chNN is the character ID: the one identifier that survives promotion and
+    // roster compaction, so it is what names a unit off-screen (the overlay
+    // keys names.json on it). Enemies and greens print it too: most are generic,
+    // but a recruitable one (Heath is ch20 among seven identical cls34 Lv7) is
+    // told apart from the rank and file by nothing else.
     if (brief) {
-      L.push(`  #${u.slot} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}${st}`);
+      L.push(`  #${u.slot} ch${hex2(u.charId)} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}${st}`);
     } else {
       const items = u.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",");
       L.push(
-        `  #${u.slot} r${hex2(u.roster)} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
+        `  #${u.slot} r${hex2(u.roster)} ch${hex2(u.charId)} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
         ` S${u.str} K${u.skl} P${u.spd} D${u.def} R${u.res} L${u.lck}${st}` + (items ? ` [${items}]` : ""),
       );
     }
@@ -1772,11 +1793,11 @@ async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
     // before choosing who takes the kill.
     const drop = dropTag(u);
     if (brief) {
-      L.push(`  #${u.slot} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}${drop}`);
+      L.push(`  #${u.slot} ch${hex2(u.charId)} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}${drop}`);
     } else {
       const items = u.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",");
       L.push(
-        `  #${u.slot} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
+        `  #${u.slot} ch${hex2(u.charId)} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
         ` S${u.str} K${u.skl} P${u.spd} D${u.def} R${u.res}` + (items ? ` [${items}]` : "") + drop,
       );
     }
@@ -1797,11 +1818,11 @@ async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
       // the chapter turns on: the objective unit IS a green, so "how much damage
       // does it survive" and "is it carrying a vulnerary" were unanswerable.
       if (brief) {
-        L.push(`  #${u.slot} r${hex2(u.roster)} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}`);
+        L.push(`  #${u.slot} r${hex2(u.roster)} ch${hex2(u.charId)} cls${hex2(u.classId)} (${u.x},${u.y}) ${u.hp}/${u.maxHp}`);
       } else {
         const items = u.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",");
         L.push(
-          `  #${u.slot} r${hex2(u.roster)} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
+          `  #${u.slot} r${hex2(u.roster)} ch${hex2(u.charId)} cls${hex2(u.classId)} Lv${u.level} (${u.x},${u.y}) HP${u.hp}/${u.maxHp}` +
           ` S${u.str} K${u.skl} P${u.spd} D${u.def} R${u.res} L${u.lck}` + (items ? ` [${items}]` : ""),
         );
       }
@@ -3950,7 +3971,7 @@ export const FE7_TOOLS: Tool[] = [
       "PURPOSE: Read and DECODE the full Fire Emblem 7 battlefield in one call — turn, phase, cursor, and every player and enemy unit with position, HP, stats, items and has-acted status. " +
       "USAGE: Call this instead of dumping the unit arrays with mgba_read_range and decoding 72-byte structs by hand; it replaces ~5KB of hex per turn. Use `brief` for a positions-and-HP-only view when planning movement, and the full view when you need stats to predict combat. " +
       "BEHAVIOR: Pure read, no side effects and no input. Units are decoded from the player array at 0x0202BD50 and the enemy array at 0x0202CEC0, stopping at the first empty slot. Benched units (x=0xFF) and dead units (current HP 0) are excluded from the listings and summarised as counts. " +
-      "RETURNS: A header line with turn/phase/cursor, then PLAYERS, ENEMIES and GREEN sections, one line per unit. Every line starts with #N, the ARRAY SLOT — the same number fe7_act's slot and target_slot take, greens included. Green lines also carry rN, the roster byte, which is NOT what any parameter wants. US release only (AGB-AE7E).",
+      "RETURNS: A header line with turn/phase/cursor, then PLAYERS, ENEMIES and GREEN sections, one line per unit. Every line starts with #N, the ARRAY SLOT — the same number fe7_act's slot and target_slot take, greens included. Every line also carries chNN, the character ID (stable across promotion and roster compaction; NN is the key into byChar in overlay/names.json, without the ch prefix). On ENEMIES and GREEN lines a chNN that is in that table is a NAMED, possibly recruitable character standing among generics of the same class, so check it before attacking. Player and green lines carry rN, the roster byte, which is NOT what any parameter wants. US release only (AGB-AE7E).",
     inputSchema: {
       type: "object",
       properties: {
