@@ -62,6 +62,43 @@ const WTYPE_STAFF = 4;
 const STAFF_PROC_SIG = [0x98, 0x69, 0xb9, 0x08];
 const STAFF_PROC_TARGET_OFF = 0x2c;
 
+// THE GAME'S OWN TARGET LIST — one mechanism behind every "pick a unit / pick a
+// tile" prompt (Rescue, Drop, Take, Give, Trade, Talk, Support, Steal, Dance, Play).
+//
+//   TARGET_LIST   64 entries x 12 bytes: s8 x, s8 y, u8 uid, u8 extra, u32 next, u32 prev
+//                 uid is the unit's +0x0B byte (player 0x01+, green 0x41+, enemy 0x81+),
+//                 or 0 when the target is a TILE (Drop).
+//   TARGET_COUNT  u32, directly after the list.
+//
+// The list is rebuilt by every menu-usability check, so on its own it is stale
+// scratch. What makes it live is the selection PROC: its +0x00 is this ROM script
+// pointer, and the search returns exactly one hit while a selection is on screen
+// and zero otherwise — the same readback-and-state-gate shape as STAFF_PROC_SIG.
+//   +0x2C  ROM pointer to the selection's handler table: identifies WHICH prompt
+//   +0x30  pointer to the highlighted TARGET_LIST entry
+// Right/Down follow `next`, Left/Up follow `prev`; the links, not the array order,
+// are the cycle order. Found on Lyn Ch.8 (2026-10-01); see RAM.md "Target list".
+const TARGET_LIST   = 0x0203dcf8;
+const TARGET_STRIDE = 12;
+const TARGET_CAP    = 64;
+const TARGET_COUNT  = 0x0203dff8;
+const TARGET_PROC_SIG = [0x2c, 0xa9, 0xb9, 0x08];
+const TPROC_INFO_OFF = 0x2c;
+const TPROC_CUR_OFF  = 0x30;
+
+// THE TRADE SCREEN's proc. Same idea: this ROM script pointer at +0x00 exists only
+// while the two-column trade screen is up.
+//   +0x2C  u32  the ACTING unit's struct     (column 0)
+//   +0x30  u32  the PARTNER's struct         (column 1)
+//   +0x41  u8   cursor column    +0x42  u8  cursor row
+//   +0x43  u8   picked column    +0x44  u8  picked row    +0x45  u8  1 while an item is picked up
+// A on an item picks it up and jumps the cursor to the other column's first empty
+// row; A again puts it there (or swaps, if the cursor was moved onto an item).
+// The unit structs are rewritten the moment the second A lands. Lyn Ch.8, 2026-10-01.
+const TRADE_PROC_SIG = [0xf8, 0x42, 0xb9, 0x08];
+const TRADE_UNITS_OFF = 0x2c;
+const TRADE_CURSOR_OFF = 0x41;
+
 // Battle-copy field offsets (u16 unless noted). See RAM.md "Combat forecast".
 const BF = {
   weaponAfter: 0x48, weaponBefore: 0x4a, wtype: 0x50,
@@ -352,6 +389,13 @@ export interface Unit {
   selected: boolean;
   deployed: boolean;
   dead: boolean;
+  /** +0x0C bit 4: carrying a rescued unit, whose uid (+0x0B) is in `carry`. */
+  rescuing: boolean;
+  /** +0x0C bit 5: being carried. It shares its carrier's tile, is hidden, and
+   *  cannot be selected; `carry` is then the CARRIER's uid. */
+  rescued: boolean;
+  /** +0x1B: uid (+0x0B byte) of the other unit in a rescue pair, 0 if none. */
+  carry: number;
   items: Array<{ id: number; uses: number }>;
   /** Weapon ranks at +0x28, indexed by weapon type. 0 = cannot use that type at all. */
   ranks: number[];
@@ -407,6 +451,9 @@ function decodeUnit(b: number[], base: number, slot: number, arrayAddr: number):
     // marks a unit that is away from the party; see RAM.md "Deployment".
     deployed: b[o + 0x10] !== 0xff && (flags & 0x00010008) === 0,
     dead: b[o + 0x13] === 0,
+    rescuing: (low & 0x10) !== 0,
+    rescued: (low & 0x20) !== 0,
+    carry: b[o + 0x1b],
     items,
     ranks: Array.from({ length: 8 }, (_, i) => b[o + 0x28 + i]),
   };
@@ -435,12 +482,30 @@ async function readArray(m: MgbaClient, arrayAddr: number): Promise<Unit[]> {
 /** Arrays are sparse, so index by slot number rather than array position. */
 const bySlot = (units: Unit[], slot: number) => units.find((u) => u.slot === slot);
 
+type Faction = "player" | "green" | "enemy";
+
+/** Faction of a uid (+0x0B): player 0x01+, green 0x41+, enemy 0x81+. */
+const uidFaction = (uid: number): Faction => (uid >= 0x80 ? "enemy" : uid >= 0x40 ? "green" : "player");
+
+/** Resolve a uid — as the target list and the rescue byte store it — to a unit. */
+function unitByUid(
+  uid: number, players: Unit[], enemies: Unit[], greens: Unit[],
+): { u: Unit; faction: Faction } | null {
+  if (uid === 0) return null;
+  const faction = uidFaction(uid);
+  const pool = faction === "enemy" ? enemies : faction === "green" ? greens : players;
+  const u = pool.find((v) => v.roster === uid);
+  return u ? { u, faction } : null;
+}
+
 /** Every tile currently occupied by a live unit of ANY faction. */
 function occupancy(...groups: Array<{ units: Unit[]; mark: string }>): Map<string, { mark: string; u: Unit }> {
   const map = new Map<string, { mark: string; u: Unit }>();
   for (const g of groups) {
     for (const u of g.units) {
-      if (u.deployed && !u.dead) map.set(`${u.x},${u.y}`, { mark: g.mark, u });
+      // A carried unit shares its carrier's tile and blocks nothing; counting it
+      // would make a rescuer's own tile read as occupied by an ally.
+      if (u.deployed && !u.dead && !u.rescued) map.set(`${u.x},${u.y}`, { mark: g.mark, u });
     }
   }
   return map;
@@ -1422,9 +1487,8 @@ const MENU_CMD_FREE: ReadonlySet<number> = new Set([
 // of the unimplemented commands to expose. What none of them has yet is a way to
 // PROVE it worked; see the handler in fe7Act for how that is handled honestly.
 const SHALLOW_CMD: Record<string, number> = {
-  visit:    MENU_CMD.visit,
-  door:     MENU_CMD.door,
-  chest:    MENU_CMD.chest,
+  // visit, door and chest started here and have since graduated: they have a
+  // confirm-by-effect signal now and are handled by mapObjectAct().
   ride:     MENU_CMD.ride,
   dismount: MENU_CMD.dismount,
   status:   MENU_CMD.status,
@@ -1554,6 +1618,88 @@ async function cycleToTarget(
   return !!ref && ref.array === wantArray && ref.slot === wantSlot;
 }
 
+// ── The target list: reading and driving any unit/tile selection ───────────
+
+interface TargetEntry { addr: number; x: number; y: number; uid: number; extra: number; next: number }
+interface TargetSelect {
+  /** ROM pointer at the proc's +0x2C — identifies which prompt this is. */
+  info: number;
+  cur: TargetEntry;
+  /** Every selectable target, in CYCLE order (following `next`), starting at `cur`. */
+  list: TargetEntry[];
+}
+
+/**
+ * The live target selection, or null when none is on screen. Pure read.
+ *
+ * Null is a real answer, not a failure: the proc signature is absent everywhere
+ * except while a selection has focus, so this doubles as the state gate for
+ * "did that menu entry actually open a target prompt".
+ */
+async function readTargetSelect(m: MgbaClient): Promise<TargetSelect | null> {
+  const r = await m.call<{ count: number; shown: unknown }>("search_memory", {
+    bytes: TARGET_PROC_SIG, region: "EWRAM", align: 4, max_results: 8,
+  });
+  const inList = (p: number) =>
+    p >= TARGET_LIST && p < TARGET_LIST + TARGET_CAP * TARGET_STRIDE && (p - TARGET_LIST) % TARGET_STRIDE === 0;
+  for (const hit of asArray<number>(r.shown)) {
+    const pb = await readRange(m, hit + TPROC_INFO_OFF, 8);
+    const info = u32(pb, 0);
+    const curPtr = u32(pb, 4);
+    // A proc slot that merely still carries the script pointer will not also
+    // hold a pointer into the list; require both.
+    if (!inList(curPtr)) continue;
+    const count = u32(await readRange(m, TARGET_COUNT, 4), 0);
+    if (count < 1 || count > TARGET_CAP) continue;
+    const raw = await readRange(m, TARGET_LIST, count * TARGET_STRIDE);
+    const at = (p: number): TargetEntry | null => {
+      const o = p - TARGET_LIST;
+      if (!inList(p) || o + TARGET_STRIDE > raw.length) return null;
+      return { addr: p, x: raw[o], y: raw[o + 1], uid: raw[o + 2], extra: raw[o + 3], next: u32(raw, o + 4) };
+    };
+    const cur = at(curPtr);
+    if (!cur) continue;
+    const list: TargetEntry[] = [cur];
+    for (let e = at(cur.next); e && e.addr !== cur.addr && list.length < count; e = at(e.next)) list.push(e);
+    return { info, cur, list };
+  }
+  return null;
+}
+
+/** Wait for a target selection to appear after pressing A on a menu entry. */
+async function awaitTargetSelect(m: MgbaClient, timeoutMs = 2500): Promise<TargetSelect | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const t = await readTargetSelect(m);
+    if (t) return t;
+    if (Date.now() >= deadline) return null;
+    await sleep(60);
+  }
+}
+
+/** Cycle the selection with Right until the highlight sits on `want`, re-reading every step. */
+async function targetSelectGoTo(m: MgbaClient, want: { x: number; y: number }): Promise<TargetSelect | null> {
+  for (let i = 0; i <= TARGET_CAP; i++) {
+    const t = await readTargetSelect(m);
+    if (!t) return null;
+    if (t.cur.x === want.x && t.cur.y === want.y) return t;
+    if (i >= t.list.length) return null; // been all the way round
+    await press(m, [{ buttons: ["Right"], frames: 4, release_frames: 18 }]);
+    await sleep(90);
+  }
+  return null;
+}
+
+/** "enemy #3 ch20 at (9,4)" — a target-list entry in the vocabulary fe7_state uses. */
+function describeTarget(t: { x: number; y: number; uid: number }, players: Unit[], enemies: Unit[], greens: Unit[]): string {
+  const hit = unitByUid(t.uid, players, enemies, greens);
+  if (!hit) return t.uid === 0 ? `tile (${t.x},${t.y})` : `uid ${hex2(t.uid)} at (${t.x},${t.y})`;
+  return `${hit.faction} #${hit.u.slot} ch${hex2(hit.u.charId)} at (${t.x},${t.y})`;
+}
+
+/** Slot whose current fe7_act call resumed an already-open menu, else -1. See unwind(). */
+let resumedSlot = -1;
+
 /**
  * Press B until the unit is back where it started, unselected and unspent.
  *
@@ -1562,6 +1708,21 @@ async function cycleToTarget(
  * returns the unit to its origin tile, so a forecast leaves no trace.
  */
 async function unwind(m: MgbaClient, slot: number, startX: number, startY: number, presses = 6): Promise<boolean> {
+  // RESUMED after a free action: the unit's base action menu is as far back as B
+  // may go — one more B there ENDS ITS TURN (the game's rule once Take, Give or
+  // Trade has been used). So back out only until that menu is on screen again,
+  // which leaves the unit still able to pick a different follow-up.
+  if (resumedSlot === slot) {
+    for (let i = 0; i < presses; i++) {
+      const open = await locateMenu(m);
+      if (open && (await menuEntryCmds(m, open.addr, open.count)).includes(MENU_CMD.wait)) return true;
+      const v = await readUnit(m, A.playerArray, slot);
+      if (v?.acted) return false;
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+      await sleep(200);
+    }
+    return false;
+  }
   for (let i = 0; i < presses; i++) {
     const v = await readUnit(m, A.playerArray, slot);
     if (v && !v.selected && !v.acted && v.x === startX && v.y === startY) return true;
@@ -1638,6 +1799,129 @@ async function awaitCommit(m: MgbaClient, slot: number, timeoutMs = 25000): Prom
   // Close a minimap a late Start may have opened. Inert if nothing is open.
   await press(m, [{ buttons: ["B"], frames: 4, release_frames: 16 }]);
   return out;
+}
+
+type Settled = { state: "acted" | "phase" | "canto" | "timeout"; turnBefore: number; turnAfter: number };
+
+/**
+ * Wait for a committed action to resolve, and say WHICH way it resolved.
+ *
+ * awaitCommit() knows two endings, spent and phase-over. A mounted unit has a
+ * third: after Rescue, Drop, Talk and the like it is handed its leftover Move
+ * ("canto") and sits selected on a move range with +0x0C reading 0x41/0x51 —
+ * bit 6 set, bit 1 clear. Polling the spent flag alone reads that as "never
+ * committed", and the skip presses then pick a tile and Wait on it by accident.
+ * So canto is reported as its own state and the caller finishes it on purpose.
+ *
+ * `c0` must be the turn clock from BEFORE the confirming press. `skipAfterMs` is
+ * how long to stay silent before starting the alternating A/Start that clears
+ * dialogue: near zero for Talk, which always raises a conversation, and several
+ * seconds for actions that only animate, where a press is nothing but a risk.
+ */
+async function settleAction(
+  m: MgbaClient, slot: number, c0: { phase: number; turn: number },
+  skipAfterMs: number, timeoutMs: number,
+): Promise<Settled> {
+  const started = Date.now();
+  let tick = 0;
+  let pressed = false;
+  let out: Settled;
+  for (;;) {
+    const [c, v] = await Promise.all([phaseClock(m), readUnit(m, A.playerArray, slot)]);
+    const low = (v?.flags ?? 0) & 0xff;
+    if (c.phase !== c0.phase || c.turn !== c0.turn) { out = { state: "phase", turnBefore: c0.turn, turnAfter: c.turn }; break; }
+    if (v?.acted) { out = { state: "acted", turnBefore: c0.turn, turnAfter: c.turn }; break; }
+    if ((low & 0x43) === 0x41) { out = { state: "canto", turnBefore: c0.turn, turnAfter: c.turn }; break; }
+    const elapsed = Date.now() - started;
+    if (elapsed >= timeoutMs) { out = { state: "timeout", turnBefore: c0.turn, turnAfter: c.turn }; break; }
+    if (elapsed >= skipAfterMs) {
+      await press(m, [{ buttons: [tick++ % 2 === 0 ? "A" : "Start"], frames: 4, release_frames: 14 }]);
+      pressed = true;
+      await sleep(SKIP_CADENCE_MS);
+    } else {
+      await sleep(80);
+    }
+  }
+  // Same tidy-up as awaitCommit: close a minimap a late Start may have opened.
+  // Not in canto — there the next press is a deliberate one.
+  if (pressed && out.state !== "canto") await press(m, [{ buttons: ["B"], frames: 4, release_frames: 16 }]);
+  return out;
+}
+
+/**
+ * Finish a canto: move the unit onto (cx,cy) if that is a legal stop within its
+ * leftover Move, otherwise leave it where it is, and commit Wait — the only entry
+ * a canto menu ever holds. Returns a sentence for the result line.
+ */
+async function finishCanto(m: MgbaClient, slot: number, cx: number | null, cy: number | null): Promise<string> {
+  const v0 = await readUnit(m, A.playerArray, slot);
+  if (!v0) return `Canto could not be finished: unit #${slot} is no longer readable.`;
+  let tx = v0.x, ty = v0.y;
+  let refused = "";
+  if (cx !== null && cy !== null && (cx !== v0.x || cy !== v0.y)) {
+    const grid = await readGrid(m);
+    const bad = gridMismatch(grid, { x: v0.x, y: v0.y });
+    const cost = bad ? UNREACHABLE : gridCost(grid, cx, cy);
+    const [players, enemies, greens] = await Promise.all([
+      readArray(m, A.playerArray), readArray(m, A.enemyArray), readArray(m, A.greenArray),
+    ]);
+    const occ = occupancy(
+      { units: players.filter((o) => o.slot !== slot), mark: "ally" },
+      { units: enemies, mark: "enemy" },
+      { units: greens, mark: "green" },
+    ).get(`${cx},${cy}`);
+    if (cost === UNREACHABLE) refused = `canto destination (${cx},${cy}) is outside its leftover Move`;
+    else if (occ) refused = `canto destination (${cx},${cy}) is occupied by ${occ.mark} #${occ.u.slot}`;
+    else { tx = cx; ty = cy; }
+  }
+
+  // A skip press that landed just as canto began may have opened the one-entry
+  // Wait menu, which swallows directions. B closes it back to the move range.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (await moveCursorTo(m, tx, ty, 5000)) break;
+    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 20 }]);
+    await sleep(200);
+  }
+  await press(m, [{ buttons: ["A"], frames: 4, release_frames: 12 }]);
+  if (tx !== v0.x || ty !== v0.y) {
+    await waitUntil(async () => {
+      const v = await readUnit(m, A.playerArray, slot);
+      return !!v && v.x === tx && v.y === ty;
+    }, 4000);
+  }
+  await sleep(300);
+
+  let v = await readUnit(m, A.playerArray, slot);
+  if (!v?.acted) {
+    await commitWait(m, A.playerArray, slot);
+    v = await readUnit(m, A.playerArray, slot);
+  }
+  const where = `(${v?.x},${v?.y})`;
+  const tail = refused ? ` NOTE: ${refused}, so it stayed put.` : "";
+  return v?.acted
+    ? `It is mounted, so it kept its leftover Move (canto): ${tx !== v0.x || ty !== v0.y ? `moved on to ${where}` : `stayed at ${where}`} and Wait committed.${tail}`
+    : `It is mounted and was handed a canto move, but the closing Wait did NOT confirm (+0x0C = 0x${hex2((v?.flags ?? 0) & 0xff)}, at ${where}). Call fe7_unstick.${tail}`;
+}
+
+/**
+ * B out of whatever another unit left on screen.
+ *
+ * A free action (Take, Give, Trade) leaves that unit's action menu OPEN, waiting
+ * for a follow-up. If the caller moves on to a different unit instead, the menu
+ * is still eating every direction press. B closes it — which, by the game's own
+ * rule, ends that unit's turn as though it had waited.
+ */
+async function releaseOtherSelection(m: MgbaClient, players: Unit[], exceptSlot: number): Promise<void> {
+  const held = (us: Unit[]) => us.find((o) => o.slot !== exceptSlot && o.deployed && !o.dead && !o.rescued && o.selected);
+  let h = held(players);
+  for (let i = 0; i < 5 && h; i++) {
+    // A MOUNTED unit does not end on that B: it drops into its canto move range,
+    // where B does nothing at all. Finish the canto in place instead.
+    if ((h.flags & 0x43) === 0x41) await finishCanto(m, h.slot, null, null);
+    else await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
+    await sleep(200);
+    h = held(await readArray(m, A.playerArray));
+  }
 }
 
 // ── Run log ────────────────────────────────────────────────────────────────
@@ -1765,7 +2049,15 @@ async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
 
   L.push(`PLAYERS:`);
   for (const u of live) {
-    const st = u.acted ? " ACTED" : "";
+    // A rescue pair shares one tile. The carried unit is hidden and cannot act,
+    // so say so instead of printing two apparently free units on one square.
+    const other = (u.rescuing || u.rescued) ? unitByUid(u.carry, players, enemies, greens) : null;
+    const pair = u.rescued
+      ? ` CARRIED by ${other ? `${other.faction} #${other.u.slot}` : `uid ${hex2(u.carry)}`} (cannot act until dropped)`
+      : u.rescuing
+        ? ` CARRYING ${other ? `${other.faction} #${other.u.slot}` : `uid ${hex2(u.carry)}`}`
+        : "";
+    const st = (u.acted && !u.rescued ? " ACTED" : "") + pair;
     // chNN is the character ID: the one identifier that survives promotion and
     // roster compaction, so it is what names a unit off-screen (the overlay
     // keys names.json on it). Enemies and greens print it too: most are generic,
@@ -1953,6 +2245,9 @@ type PrologueResult =
       ok: true;
       u: Unit; players: Unit[]; enemies: Unit[]; greens: Unit[];
       cost: number; startX: number; startY: number;
+      /** The unit's action menu was ALREADY open — it used a free action (Take,
+       *  Give, Trade) earlier this turn — so nothing was selected or walked. */
+      resumed?: boolean;
     };
 
 async function prologue(
@@ -1973,9 +2268,46 @@ async function prologue(
   if (!u) return { ok: false, text: `No player unit in slot ${slot}.` };
   if (!u.deployed) return { ok: false, text: `Unit #${slot} is benched.` };
   if (u.dead) return { ok: false, text: `Unit #${slot} is dead.` };
+  if (u.rescued) {
+    const by = unitByUid(u.carry, players, enemies, greens);
+    return {
+      ok: false,
+      text:
+        `Unit #${slot} is being CARRIED by ${by ? `${by.faction} #${by.u.slot}` : `uid ${hex2(u.carry)}`} at (${u.x},${u.y}) — ` +
+        `a rescued unit is hidden and cannot be selected until its carrier uses action="drop". Nothing was pressed.`,
+    };
+  }
   if (u.acted) return { ok: false, text: `Unit #${slot} has already acted this phase (+0x0C = 0x42).` };
 
   const startX = u.x, startY = u.y;
+
+  await releaseOtherSelection(m, players, slot);
+
+  // 0. RESUME. A free action (Take, Give, Trade) does not end the unit's turn: the
+  //    game reopens its action menu and waits. The unit is then already selected
+  //    with a menu on screen, and the normal opening — cursor to the unit, A, cursor
+  //    to the destination, A — would send that last A into whatever entry is
+  //    highlighted. So recognise the state and hand the open menu straight to the
+  //    action handlers, which all start from exactly here.
+  if (u.selected) {
+    const open = await locateMenu(m);
+    const cmds = open ? await menuEntryCmds(m, open.addr, open.count) : [];
+    // A one-entry menu ([wait]) cannot be located by diff; it shows up as a
+    // selected unit whose cursor will not move.
+    const menuUp = open ? cmds.includes(MENU_CMD.wait) : !(await cursorResponds(m));
+    if (menuUp) {
+      if (destX !== startX || destY !== startY) {
+        return {
+          ok: false,
+          text:
+            `Unit #${slot} already used a free action this turn and its action menu is open at (${startX},${startY})` +
+            (open ? ` — [${cmds.map(cmdName).join(", ")}]` : ``) +
+            `. It can no longer move: call again with x=${startX}, y=${startY}. Nothing was pressed.`,
+        };
+      }
+      return { ok: true, u, players, enemies, greens, cost: 0, startX, startY, resumed: true };
+    }
+  }
 
   // 1. Cursor onto the unit, then select.
   if (!u.selected) {
@@ -2079,6 +2411,665 @@ async function prologue(
   };
 }
 
+// ── Target-selection commands ──────────────────────────────────────────────
+//
+// Talk, Support, Dance/Play, Rescue, Drop, Take and Give all have one shape: an
+// entry on the action menu that opens the game's target prompt, where one more A
+// commits. Everything they need is already nameable — the entry by its ROM command
+// pointer, the candidates and the highlight by the target list — so nothing is
+// pressed on anything that was not read first, and each is CONFIRMED BY EFFECT.
+//
+//   free  the command does not end the unit's turn; the game reopens its menu.
+//   talky the commit raises a conversation, so skip presses start at once.
+//   why   what the game requires before it will offer the entry at all — printed
+//         when the entry is absent, because "not on the menu" is otherwise opaque.
+const TARGETED_CMD: Record<string, { cmds: number[]; label: string; free: boolean; talky: boolean; why: string }> = {
+  talk: {
+    cmds: [MENU_CMD.talk], label: "Talk", free: false, talky: true,
+    why: "Talk is only offered when this unit stands NEXT TO a character it has a conversation with on this chapter — the right speaker matters as much as the tile.",
+  },
+  support: {
+    cmds: [MENU_CMD.support], label: "Support", free: false, talky: true,
+    why: "Support is only offered next to a support partner once the pair has built enough points for its next conversation.",
+  },
+  dance: {
+    cmds: [MENU_CMD.dance, MENU_CMD.play], label: "Dance/Play", free: false, talky: false,
+    why: "Dance (Ninian) / Play (Nils) is only offered next to an ally that has ALREADY acted this turn — there is nobody to refresh otherwise.",
+  },
+  play: {
+    cmds: [MENU_CMD.play, MENU_CMD.dance], label: "Dance/Play", free: false, talky: false,
+    why: "Dance (Ninian) / Play (Nils) is only offered next to an ally that has ALREADY acted this turn — there is nobody to refresh otherwise.",
+  },
+  rescue: {
+    cmds: [MENU_CMD.rescue], label: "Rescue", free: false, talky: false,
+    why: "Rescue needs an adjacent ally whose Con is no more than this unit's Aid, and this unit must not already be carrying someone.",
+  },
+  drop: {
+    cmds: [MENU_CMD.drop], label: "Drop", free: false, talky: false,
+    why: "Drop needs this unit to be carrying someone, and a free adjacent tile the carried unit can stand on.",
+  },
+  steal: {
+    cmds: [MENU_CMD.steal], label: "Steal", free: false, talky: false,
+    why: "Steal is only offered to a THIEF standing next to an enemy that carries something stealable — an item, never a weapon, tome or staff — and the thief needs a free inventory slot.",
+  },
+  trade: {
+    cmds: [MENU_CMD.trade], label: "Trade", free: true, talky: false,
+    why: "Trade is only offered next to another PLAYER unit, and at least one of the two must be carrying something.",
+  },
+  take: {
+    cmds: [MENU_CMD.take], label: "Take", free: true, talky: false,
+    why: "Take needs an adjacent ally that is carrying someone light enough for this unit's Aid, and this unit must not already be carrying.",
+  },
+  give: {
+    cmds: [MENU_CMD.give], label: "Give", free: true, talky: false,
+    why: "Give needs this unit to be carrying someone, and an adjacent ally with the Aid to take them who is not already carrying.",
+  },
+};
+
+/** The live trade screen: proc address plus cursor state, or null when it is not up. */
+async function readTradeScreen(m: MgbaClient): Promise<{
+  base: number; me: number; partner: number; col: number; row: number; picked: boolean;
+} | null> {
+  const r = await m.call<{ count: number; shown: unknown }>("search_memory", {
+    bytes: TRADE_PROC_SIG, region: "EWRAM", align: 4, max_results: 8,
+  });
+  for (const hit of asArray<number>(r.shown)) {
+    const b = await readRange(m, hit + TRADE_UNITS_OFF, 0x1c);
+    const me = u32(b, 0), partner = u32(b, 4);
+    if (!unitRefFromAddr(me) || !unitRefFromAddr(partner)) continue;
+    const c = TRADE_CURSOR_OFF - TRADE_UNITS_OFF;
+    return { base: hit, me, partner, col: b[c], row: b[c + 1], picked: b[c + 4] === 1 };
+  }
+  return null;
+}
+
+/** Put the trade cursor on (col,row), re-reading after every press. */
+async function tradeGoTo(m: MgbaClient, col: number, row: number): Promise<boolean> {
+  for (let i = 0; i < 14; i++) {
+    const t = await readTradeScreen(m);
+    if (!t) return false;
+    if (t.col === col && t.row === row) return true;
+    const btn = t.col !== col ? (col === 1 ? "Right" : "Left") : "Down";
+    await press(m, [{ buttons: [btn], frames: 4, release_frames: 18 }]);
+    await sleep(110);
+  }
+  const t = await readTradeScreen(m);
+  return !!t && t.col === col && t.row === row;
+}
+
+// The four dancer's rings — Filla's Might, Ninis's Grace, Thor's Ire, Set's Litany.
+// While Ninian or Nils carries any of them, Dance/Play stops going straight to the
+// target prompt and opens a sub-menu first: entry 0 is the plain Dance/Play, then
+// one entry per ring in inventory order. Seen on Lyn Ch.8 with two rings written
+// into Nils's inventory (2026-10-01).
+const DANCER_RINGS: ReadonlySet<number> = new Set([0x7c, 0x7d, 0x7e, 0x7f]);
+
+const arrayOfFaction = (f: Faction) => (f === "enemy" ? A.enemyArray : f === "green" ? A.greenArray : A.playerArray);
+
+async function targetedAct(
+  m: MgbaClient,
+  slot: number,
+  destX: number,
+  destY: number,
+  action: string,
+  targetSlot: number | null,
+  targetFaction: string,
+  itemSlot: number | null,
+  extra: ActExtra,
+  pro: Extract<PrologueResult, { ok: true }>,
+): Promise<ActResult> {
+  const spec = TARGETED_CMD[action];
+  const { players, enemies, greens, cost, startX, startY } = pro;
+  const moved = `(${startX},${startY}) -> (${destX},${destY}) cost ${cost}`;
+  const backedOut = `Backed out; unit #${slot} unspent at (${startX},${startY}).`;
+
+  const menu = await locateMenu(m);
+  if (!menu) {
+    await unwind(m, slot, startX, startY);
+    return { text: `Unit #${slot} reached (${destX},${destY}) but the action menu could not be located. ${backedOut}` };
+  }
+  const cmds = await menuEntryCmds(m, menu.addr, menu.count);
+  const shape = cmds.map(cmdName).join(", ");
+  const idx = cmds.findIndex((c) => spec.cmds.includes(c));
+  if (idx < 0) {
+    await unwind(m, slot, startX, startY);
+    return {
+      text:
+        `No ${spec.label} entry on unit #${slot}'s action menu at (${destX},${destY}) — the menu holds [${shape}]. ` +
+        `${spec.why} Nothing was pressed; unit unspent at (${startX},${startY}).`,
+    };
+  }
+  if (!(await menuGoTo(m, menu.addr, idx, menu.count))) {
+    await unwind(m, slot, startX, startY);
+    return { text: `Found ${spec.label} at index ${idx} of [${shape}] but could not move the highlight onto it. ${backedOut}` };
+  }
+
+  const dancing = action === "dance" || action === "play";
+  const rings = dancing ? pro.u.items.map((it, i) => (DANCER_RINGS.has(it.id) ? i : -1)).filter((i) => i >= 0) : [];
+  if (dancing && itemSlot !== null && !rings.includes(itemSlot)) {
+    await unwind(m, slot, startX, startY);
+    return {
+      text:
+        `item_slot ${itemSlot} on unit #${slot} is not one of the dancer's rings ` +
+        `(inventory ${pro.u.items.map((i) => hex2(i.id)).join(",") || "empty"}; ring slots: ${rings.join(", ") || "none"}). ` +
+        `Omit item_slot for a plain ${spec.label}. ${backedOut}`,
+    };
+  }
+
+  await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
+  let sel = await awaitTargetSelect(m, rings.length ? 900 : 2500);
+  if (!sel && rings.length) {
+    // The ring sub-menu: [Dance/Play, ring, ring…]. Its length is known from the
+    // inventory, so a list of any other size is not this menu and is not driven.
+    const sub = await locateMenu(m);
+    const wantEntry = itemSlot === null ? 0 : 1 + rings.indexOf(itemSlot);
+    if (sub && sub.count === rings.length + 1 && (await menuGoTo(m, sub.addr, wantEntry, sub.count))) {
+      await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
+      sel = await awaitTargetSelect(m);
+    }
+  }
+  if (!sel) {
+    const note = await readText(m);
+    await unwind(m, slot, startX, startY);
+    return {
+      text:
+        `${spec.label} (index ${idx} of [${shape}]) was chosen but no target selection opened within 2.5s — ` +
+        `text buffer ${JSON.stringify(note)}. ${backedOut}`,
+    };
+  }
+
+  // WHO. A tile, a slot, or — when the game offers exactly one candidate — nobody
+  // named at all. Whatever was asked for must be in the game's own list.
+  const offered = sel.list.map((e) => describeTarget(e, players, enemies, greens)).join("; ");
+  let want: { x: number; y: number } | null = null;
+  let asked = "";
+  if (extra.targetX !== null && extra.targetY !== null) {
+    want = { x: extra.targetX, y: extra.targetY };
+    asked = `(${want.x},${want.y})`;
+  } else if (targetSlot !== null) {
+    const fac = (extra.factionGiven ? targetFaction : action === "steal" ? "enemy" : "player") as Faction;
+    const pool = fac === "enemy" ? enemies : fac === "green" ? greens : players;
+    const t = bySlot(pool, targetSlot);
+    if (!t || t.dead) {
+      await unwind(m, slot, startX, startY);
+      return { text: `No living ${fac} unit in slot ${targetSlot}. ${spec.label} offers: ${offered}. ${backedOut}` };
+    }
+    want = { x: t.x, y: t.y };
+    asked = `${fac} #${targetSlot} at (${t.x},${t.y})`;
+  } else if (sel.list.length === 1) {
+    want = { x: sel.cur.x, y: sel.cur.y };
+  } else {
+    await unwind(m, slot, startX, startY);
+    return {
+      text:
+        `${spec.label} from (${destX},${destY}) has ${sel.list.length} possible targets — ${offered}. ` +
+        `Say which: target_slot (with target_faction) or target_x/target_y. ${backedOut}`,
+    };
+  }
+  if (!sel.list.some((e) => e.x === want!.x && e.y === want!.y)) {
+    await unwind(m, slot, startX, startY);
+    return {
+      text:
+        `${asked} is not a ${spec.label} target from (${destX},${destY}). The game offers: ${offered}. ${backedOut}`,
+    };
+  }
+  const on = await targetSelectGoTo(m, want);
+  if (!on) {
+    await unwind(m, slot, startX, startY);
+    return { text: `Could not cycle the ${spec.label} selection onto (${want.x},${want.y}); it offers ${offered}. ${backedOut}` };
+  }
+
+  const tgt = unitByUid(on.cur.uid, players, enemies, greens);
+  const named = describeTarget(on.cur, players, enemies, greens);
+  const actorBefore = await readUnit(m, A.playerArray, slot);
+  const tgtBefore = tgt ? await readUnit(m, arrayOfFaction(tgt.faction), tgt.u.slot) : null;
+  const passenger = actorBefore?.rescuing ? unitByUid(actorBefore.carry, players, enemies, greens) : null;
+  const c0 = await phaseClock(m);
+  // +0x32..+0x38 are the seven support counters, +0x39 one bit per partner whose
+  // conversation has been seen this level. A support conversation bumps the
+  // counter past its cap (0x50 -> 0x51) and sets the bit, on both units.
+  const supportBytes = async () => (actorBefore ? (await readRange(m, actorBefore.addr + 0x32, 8)).map(hex2).join(" ") : "");
+  const supBefore = action === "support" ? await supportBytes() : "";
+  const invOf = (v: Unit | null | undefined) => v?.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",") || "-";
+
+  // ── Steal: one more screen, the victim's inventory ──
+  //
+  // Confirming the target opens a list of EVERYTHING the enemy carries, in its
+  // inventory order, highlight on entry 0. Weapons, tomes and staves are listed
+  // but cannot be taken: A on one raises a help box ("Weapons, magic, and staves
+  // can't be stolen.") that then swallows input. So the entry is chosen by
+  // inventory slot and checked against the item table BEFORE the target is
+  // confirmed, while backing out is still a clean unwind.
+  if (action === "steal") {
+    const victim = tgtBefore;
+    const types = victim ? await Promise.all(victim.items.map((i) => itemType(m, i.id))) : [];
+    const stealable = types.map((t, i) => (t > 7 ? i : -1)).filter((i) => i >= 0);
+    const wantInv = itemSlot ?? stealable[0];
+    if (!victim || wantInv === undefined || !stealable.includes(wantInv)) {
+      await unwind(m, slot, startX, startY);
+      return {
+        text:
+          `${named} carries [${invOf(victim)}]` +
+          (itemSlot === null
+            ? ` — nothing there can be stolen.`
+            : ` and inventory slot ${itemSlot} is ${itemSlot < (victim?.items.length ?? 0) ? "a weapon, tome or staff, which cannot be stolen" : "empty"}` +
+              (stealable.length ? `; stealable slot(s): ${stealable.join(", ")}.` : `; nothing there can be stolen.`)) +
+          ` ${backedOut}`,
+      };
+    }
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    await sleep(450);
+    if (victim.items.length > 1) {
+      // A one-entry list cannot be located by diff and needs no navigation.
+      const list = await locateMenu(m);
+      if (!list || list.count !== victim.items.length || !(await menuGoTo(m, list.addr, wantInv, list.count))) {
+        await unwind(m, slot, startX, startY);
+        return {
+          text:
+            `Steal from ${named}: the item list ${list ? `read ${list.count} entries against an inventory of ${victim.items.length}` : "could not be located"}, ` +
+            `so nothing was confirmed. ${backedOut}`,
+        };
+      }
+    }
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    const st = await settleAction(m, slot, c0, 5000, 30000);
+    const cantoS = st.state === "canto" ? await finishCanto(m, slot, extra.cantoX, extra.cantoY) : "";
+    const me = await readUnit(m, A.playerArray, slot);
+    const them = tgt ? await readUnit(m, arrayOfFaction(tgt.faction), tgt.u.slot) : null;
+    const taken = victim.items[wantInv];
+    const got = (me?.items.filter((i) => i.id === taken.id).length ?? 0) > (actorBefore?.items.filter((i) => i.id === taken.id).length ?? 0);
+    const lost = (them?.items.length ?? 0) === victim.items.length - 1;
+    return {
+      text:
+        `Unit #${slot}: ${moved}, Steal from ${named} — ` +
+        (got && lost
+          ? `STOLEN: item 0x${hex2(taken.id)}x${taken.uses} (its inventory slot ${wantInv}).`
+          : `but the inventories do not show item 0x${hex2(taken.id)} changing hands.`) +
+        ` Unit #${slot} inventory ${invOf(actorBefore)} -> ${invOf(me)}; ${named.split(" at ")[0]} ${invOf(victim)} -> ${invOf(them)}.` +
+        ` Unit #${slot} +0x0C = 0x${hex2((me?.flags ?? 0) & 0xff)}.` +
+        (st.state === "phase"
+          ? ` It was the last unspent unit, so the player phase ended (turn ${st.turnBefore} -> ${st.turnAfter}).`
+          : st.state === "timeout"
+            ? ` WARNING: unit #${slot} never became spent — something is still on screen; call fe7_unstick.`
+            : cantoS ? ` ${cantoS}` : ``),
+    };
+  }
+
+  // ── Trade: the two-column item screen ──
+  //
+  //   give only   item_slot       -> lands in the partner's first empty slot
+  //   take only   take_item_slot  -> lands in this unit's first empty slot
+  //   both        the two items SWAP, which is the only way to trade when the
+  //               receiving side is already carrying five
+  // Everything is validated against the two inventories before the partner is
+  // confirmed, so a bad request is still a clean unwind.
+  if (action === "trade") {
+    const me0 = actorBefore, pt0 = tgtBefore;
+    const give = itemSlot, take = extra.takeSlot;
+    const refuse = (why: string) =>
+      `Trade with ${named}: ${why} Unit #${slot} carries [${invOf(me0)}], ${named.split(" at ")[0]} carries [${invOf(pt0)}]. ${backedOut}`;
+    let bad = "";
+    if (!me0 || !pt0 || tgt?.faction !== "player") bad = `that is not a player unit.`;
+    else if (give === null && take === null) bad = `say what to move — item_slot (this unit's slot to GIVE) and/or take_item_slot (the partner's slot to TAKE).`;
+    else if (give !== null && (give < 0 || give >= me0.items.length)) bad = `item_slot ${give} is empty on unit #${slot}.`;
+    else if (take !== null && (take < 0 || take >= pt0.items.length)) bad = `take_item_slot ${take} is empty on the partner.`;
+    else if (give !== null && take === null && pt0.items.length >= 5) bad = `the partner already carries 5 items, so a one-way give has nowhere to land — also pass take_item_slot to SWAP.`;
+    else if (take !== null && give === null && me0.items.length >= 5) bad = `unit #${slot} already carries 5 items, so a one-way take has nowhere to land — also pass item_slot to SWAP.`;
+    if (bad) {
+      await unwind(m, slot, startX, startY);
+      return { text: refuse(bad) };
+    }
+
+    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+    const up = await waitUntil(async () => (await readTradeScreen(m)) !== null, 2500, 60);
+    const scr = up ? await readTradeScreen(m) : null;
+    if (!scr || scr.me !== me0!.addr || scr.partner !== pt0!.addr) {
+      await unwind(m, slot, startX, startY);
+      return { text: refuse(`the trade screen ${scr ? "opened for a different pair of units" : "did not open"}.`) };
+    }
+
+    // First A picks an item up; the cursor jumps across; second A puts it down.
+    const from = give !== null ? { col: 0, row: give } : { col: 1, row: take! };
+    let step = "";
+    if (!(await tradeGoTo(m, from.col, from.row))) step = `could not put the cursor on column ${from.col} row ${from.row}`;
+    if (!step) {
+      await press(m, [{ buttons: ["A"], frames: 4, release_frames: 20 }]);
+      await sleep(260);
+      const mid = await readTradeScreen(m);
+      if (!mid?.picked) step = `A on column ${from.col} row ${from.row} did not pick the item up`;
+      else if (give !== null && take !== null && !(await tradeGoTo(m, 1, take))) step = `could not put the cursor on the partner's row ${take} for the swap`;
+    }
+    if (!step) {
+      await press(m, [{ buttons: ["A"], frames: 4, release_frames: 22 }]);
+      await sleep(350);
+    }
+    const me1 = await readUnit(m, A.playerArray, slot);
+    const pt1 = await readUnit(m, A.playerArray, tgt!.u.slot);
+    const changed = invOf(me1) !== invOf(me0) || invOf(pt1) !== invOf(pt0);
+
+    // Leave the screen: B drops a picked-up item first, then closes it.
+    for (let i = 0; i < 3 && (await readTradeScreen(m)); i++) {
+      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 24 }]);
+      await sleep(260);
+    }
+    await sleep(350);
+    const table =
+      `  #${slot}: [${invOf(me0)}] -> [${invOf(me1)}]\n` +
+      `  ${named.split(" at ")[0]}: [${invOf(pt0)}] -> [${invOf(pt1)}]`;
+    if (!changed) {
+      // Nothing moved, so the game treats Trade as never used and B unwinds normally.
+      await unwind(m, slot, startX, startY);
+      return { text: `Trade with ${named} — NOTHING CHANGED HANDS${step ? ` (${step})` : ""}.\n${table}\n  ${backedOut}` };
+    }
+    const reopened = await locateMenu(m);
+    const now = reopened ? (await menuEntryCmds(m, reopened.addr, reopened.count)).map(cmdName).join(", ") : "";
+    return {
+      text:
+        `Unit #${slot}: ${moved}, Trade with ${named} — TRADED.\n${table}\n` +
+        `  Trade is a FREE action: unit #${slot} has NOT used its turn and its action menu is open again` +
+        (now ? ` — [${now}]` : ``) + `.\n` +
+        `  Finish it with another fe7_act for unit #${slot} at x=${me1?.x}, y=${me1?.y} (it can no longer move): ` +
+        `wait, attack, item… (the game offers Trade only once per unit per turn, so the entry is gone now). If you act with a different unit first, this one's turn simply ends where it stands.`,
+    };
+  }
+
+  await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+
+  // ── Free actions: Take, Give ──
+  if (spec.free) {
+    const landed = await waitUntil(async () => {
+      const v = await readUnit(m, A.playerArray, slot);
+      return !!v && v.carry !== (actorBefore?.carry ?? 0);
+    }, 6000, 60);
+    await sleep(600);
+    const v = await readUnit(m, A.playerArray, slot);
+    const other = tgt ? await readUnit(m, arrayOfFaction(tgt.faction), tgt.u.slot) : null;
+    const reopened = await locateMenu(m);
+    const now = reopened ? (await menuEntryCmds(m, reopened.addr, reopened.count)).map(cmdName).join(", ") : "";
+    const carrying = (w: Unit | null) => {
+      if (!w?.rescuing) return "carrying nobody";
+      const p = unitByUid(w.carry, players, enemies, greens);
+      return `CARRYING ${p ? `${p.faction} #${p.u.slot}` : `uid ${hex2(w.carry)}`}`;
+    };
+    if (!landed) {
+      return {
+        text:
+          `Unit #${slot}: ${moved}, ${spec.label} on ${named} was confirmed but the rescue byte never changed ` +
+          `(#${slot} is ${carrying(v)}). Something is still on screen — call fe7_unstick.`,
+      };
+    }
+    return {
+      text:
+        `Unit #${slot}: ${moved}, ${spec.label} with ${named} — #${slot} is now ${carrying(v)}, and ${named.split(" at ")[0]} is ${carrying(other)}.\n` +
+        `  ${spec.label} is a FREE action: unit #${slot} has NOT used its turn and its action menu is open again` +
+        (now ? ` — [${now}]` : ``) + `.\n` +
+        `  Finish it with another fe7_act for unit #${slot} at x=${v?.x}, y=${v?.y} (it can no longer move): ` +
+        `wait, drop, attack, item… If you act with a different unit first, this one's turn simply ends where it stands.`,
+    };
+  }
+
+  // ── Everything else ends the turn (or hands a mounted unit its canto) ──
+  const s = await settleAction(m, slot, c0, spec.talky ? 700 : 6000, spec.talky ? 90000 : 30000);
+  const canto = s.state === "canto" ? await finishCanto(m, slot, extra.cantoX, extra.cantoY) : "";
+
+  const [pAfter, eAfter, gAfter] = await Promise.all([
+    readArray(m, A.playerArray), readArray(m, A.enemyArray), readArray(m, A.greenArray),
+  ]);
+  const self = bySlot(pAfter, slot);
+  const flags = `+0x0C = 0x${hex2((self?.flags ?? 0) & 0xff)}`;
+  const ending =
+    s.state === "phase"
+      ? ` It was the last unspent unit, so the player phase ended (turn ${s.turnBefore} -> ${s.turnAfter}).`
+      : s.state === "timeout"
+        ? ` WARNING: unit #${slot} never became spent (${flags}) — something is still on screen; call fe7_unstick.`
+        : canto ? ` ${canto}` : ``;
+  const head = `Unit #${slot}: ${moved}, ${spec.label}`;
+
+  if (dancing && itemSlot !== null) {
+    // A ring blesses the target instead of refreshing it; the proof is the ring's
+    // own use counter.
+    const ring = actorBefore?.items[itemSlot];
+    const now = self?.items.find((i) => i.id === ring?.id);
+    const spentUse = !!ring && (!now || now.uses < ring.uses);
+    return {
+      text:
+        `${head} with ring 0x${hex2(ring?.id ?? 0)} on ${named} — ` +
+        (spentUse
+          ? `USED: the ring went ${ring!.uses} -> ${now ? now.uses : 0} uses. A ring buffs the target for a turn; it does NOT give it another action.`
+          : `but the ring's uses did not change (${invOf(actorBefore)} -> ${invOf(self)}).`) +
+        ` Unit #${slot} ${flags}.` + ending,
+    };
+  }
+
+  if (dancing) {
+    const t = tgt ? bySlot(tgt.faction === "player" ? pAfter : tgt.faction === "green" ? gAfter : eAfter, tgt.u.slot) : null;
+    const refreshed = !!tgtBefore?.acted && !!t && !t.acted;
+    return {
+      text:
+        `${head} for ${named} — ` +
+        (refreshed
+          ? `REFRESHED: its has-acted flag cleared (0x${hex2((tgtBefore?.flags ?? 0) & 0xff)} -> 0x${hex2((t?.flags ?? 0) & 0xff)}), so it can act again this turn.`
+          : `but its has-acted flag did not clear (0x${hex2((tgtBefore?.flags ?? 0) & 0xff)} -> 0x${hex2((t?.flags ?? 0) & 0xff)}).`) +
+        ` Unit #${slot} ${flags}.` + ending,
+    };
+  }
+
+  if (action === "rescue") {
+    const ok = !!self?.rescuing && self.carry === on.cur.uid;
+    return {
+      text:
+        `${head} of ${named} — ` +
+        (ok
+          ? `RESCUED: unit #${slot} is now carrying it (rescue byte 0x${hex2(self!.carry)}). The carried unit is hidden, cannot act, ` +
+            `and travels with #${slot} until action="drop"; carrying halves #${slot}'s Skl and Spd.`
+          : `but unit #${slot} is not carrying it (${flags}, rescue byte 0x${hex2(self?.carry ?? 0)}).`) +
+        ending,
+    };
+  }
+
+  if (action === "drop") {
+    const p = passenger
+      ? bySlot(passenger.faction === "player" ? pAfter : passenger.faction === "green" ? gAfter : eAfter, passenger.u.slot)
+      : null;
+    const ok = !!self && !self.rescuing && !!p && !p.rescued && p.x === on.cur.x && p.y === on.cur.y;
+    const who = passenger ? `${passenger.faction} #${passenger.u.slot}` : "the carried unit";
+    return {
+      text:
+        `${head} onto (${on.cur.x},${on.cur.y}) — ` +
+        (ok
+          ? `DROPPED: ${who} now stands at (${p!.x},${p!.y}) and unit #${slot} carries nobody. A dropped unit cannot act until next turn.`
+          : `but ${who} is at (${p?.x},${p?.y})${p?.rescued ? ", still carried" : ""} and unit #${slot} ${self?.rescuing ? "is still carrying" : "carries nobody"} (${flags}).`) +
+        ending,
+    };
+  }
+
+  // talk / support
+  let outcome = "";
+  if (action === "support") {
+    const supAfter = await supportBytes();
+    outcome = supAfter !== supBefore
+      ? ` SUPPORT GAINED: unit #${slot}'s support record (+0x32..+0x39) went ${supBefore} -> ${supAfter}; the pair now give each other bonuses when within 3 tiles.`
+      : ` Unit #${slot}'s support record did not change (${supBefore}).`;
+  }
+  if (tgt && tgt.faction !== "player") {
+    const joined = pAfter.find((p) => p.charId === tgt.u.charId && p.deployed && !p.dead);
+    outcome = joined
+      ? ` RECRUITED: ch${hex2(tgt.u.charId)} left the ${tgt.faction} side and is now PLAYER #${joined.slot} at (${joined.x},${joined.y})` +
+        `${joined.acted ? ", already spent this turn" : ""}. Slot numbers may have shifted — re-read fe7_state.`
+      : ` ch${hex2(tgt.u.charId)} did NOT change sides: no player unit carries that character ID. ` +
+        `Either this conversation is not a recruitment, or the wrong speaker was used.`;
+  }
+  const note = await readText(m);
+  return {
+    text:
+      `${head} with ${named} — the conversation ${s.state === "timeout" ? "did not finish" : "ran and unit #" + slot + " is spent"} (${flags}).` +
+      outcome + ending + ` Text buffer: ${JSON.stringify(note)}.`,
+  };
+}
+
+// ── Map-object commands: Visit, Door, Chest ────────────────────────────────
+//
+// One A on the menu entry and the game does the rest. These were first exposed as
+// "shallow tier" commands that reported a raw delta and refused to say whether
+// they had worked, because no confirm-by-effect signal was known. The signals are
+// known now (Lyn Ch.3 and Hector Ch.15/17, 2026-10-01), so each gets a verdict:
+//
+//   visit  the unit becomes spent, which the game only does once the visit event
+//          has run. A VILLAGE also closes — its terrain ID goes 0x03 -> 0x04 — while
+//          a house (0x05) changes nothing on the map. A character who joins shows
+//          up as a new player unit; a gift shows up in the inventory.
+//   door   the door tile NEXT TO the unit stops being terrain 0x1E, and a key or
+//          lockpick loses a use.
+//   chest  the tile UNDER the unit changes from the closed-chest ID, and the
+//          contents land in the inventory (or as gold, which is not read here).
+const MAP_OBJECT_CMD: Record<string, { cmd: number; label: string; why: string }> = {
+  visit: {
+    cmd: MENU_CMD.visit, label: "Visit",
+    why: "Visit is only offered to a unit standing ON a village or house tile that is still open (fe7_terrain with find:'village|house' lists them).",
+  },
+  door: {
+    cmd: MENU_CMD.door, label: "Door",
+    why: "Door is only offered to a unit standing NEXT TO a door while carrying a Door Key, or to a thief carrying a Lockpick.",
+  },
+  chest: {
+    cmd: MENU_CMD.chest, label: "Chest",
+    why: "Chest is only offered to a unit standing ON a closed chest while carrying a Chest Key, or to a thief carrying a Lockpick.",
+  },
+};
+
+const TERRAIN_DOOR = 0x1e;
+
+async function mapObjectAct(
+  m: MgbaClient,
+  slot: number,
+  destX: number,
+  destY: number,
+  action: string,
+  extra: ActExtra,
+  pro: Extract<PrologueResult, { ok: true }>,
+): Promise<ActResult> {
+  const spec = MAP_OBJECT_CMD[action];
+  const { players, cost, startX, startY } = pro;
+  const moved = `(${startX},${startY}) -> (${destX},${destY}) cost ${cost}`;
+  const backedOut = `Backed out; unit #${slot} unspent at (${startX},${startY}).`;
+
+  const menu = await locateMenu(m);
+  if (!menu) {
+    await unwind(m, slot, startX, startY);
+    return { text: `Unit #${slot} reached (${destX},${destY}) but the action menu could not be located. ${backedOut}` };
+  }
+  const cmds = await menuEntryCmds(m, menu.addr, menu.count);
+  const shape = cmds.map(cmdName).join(", ");
+  const idx = cmds.indexOf(spec.cmd);
+  if (idx < 0) {
+    const here = await terrainAt(m, destX, destY);
+    await unwind(m, slot, startX, startY);
+    return {
+      text:
+        `No ${spec.label} entry on unit #${slot}'s action menu at (${destX},${destY}) — the menu holds [${shape}], ` +
+        `and the tile is ${terrainName(here ?? -1)}${here === null ? "" : ` (0x${hex2(here)})`}. ${spec.why} ` +
+        `Nothing was pressed; unit unspent at (${startX},${startY}).`,
+    };
+  }
+  if (!(await menuGoTo(m, menu.addr, idx, menu.count))) {
+    await unwind(m, slot, startX, startY);
+    return { text: `Found ${spec.label} at index ${idx} of [${shape}] but could not move the highlight onto it. ${backedOut}` };
+  }
+
+  // A door is beside the unit, a village or chest is under it.
+  const watch = action === "door"
+    ? [{ x: destX, y: destY - 1 }, { x: destX + 1, y: destY }, { x: destX, y: destY + 1 }, { x: destX - 1, y: destY }]
+    : [{ x: destX, y: destY }];
+  const terrain = () => Promise.all(watch.map((t) => terrainAt(m, t.x, t.y)));
+  const inv = (v: Unit | null) => v?.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",") || "-";
+  const tBefore = await terrain();
+  const actorBefore = await readUnit(m, A.playerArray, slot);
+  const partyBefore = new Set(players.filter((p) => p.deployed && !p.dead).map((p) => p.charId));
+  const c0 = await phaseClock(m);
+
+  await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+  // A visit always raises a conversation; a door or chest only animates, then a
+  // chest shows a "got an item" box that an A dismisses.
+  const s = await settleAction(m, slot, c0, action === "visit" ? 700 : 2500, 60000);
+  const canto = s.state === "canto" ? await finishCanto(m, slot, extra.cantoX, extra.cantoY) : "";
+
+  const tAfter = await terrain();
+  const pAfter = await readArray(m, A.playerArray);
+  const self = bySlot(pAfter, slot) ?? null;
+  const flags = `+0x0C = 0x${hex2((self?.flags ?? 0) & 0xff)}`;
+  const changed = watch
+    .map((t, i) => ({ ...t, a: tBefore[i], b: tAfter[i] }))
+    .filter((t) => t.a !== t.b && t.a !== null && t.b !== null);
+  const terrainNote = changed
+    .map((t) => `(${t.x},${t.y}) ${terrainName(t.a!)} 0x${hex2(t.a!)} -> ${terrainName(t.b!)} 0x${hex2(t.b!)}`)
+    .join("; ");
+  const invNote = inv(actorBefore) !== inv(self) ? ` Inventory ${inv(actorBefore)} -> ${inv(self)}.` : ` Inventory unchanged (${inv(self)}).`;
+  const joined = pAfter.filter((p) => p.deployed && !p.dead && !partyBefore.has(p.charId));
+  const joinNote = joined.length
+    ? ` JOINED: ${joined.map((p) => `ch${hex2(p.charId)} is now PLAYER #${p.slot} at (${p.x},${p.y})`).join("; ")} — re-read fe7_state, slots may have shifted.`
+    : ``;
+  const ending =
+    s.state === "phase"
+      ? ` It was the last unspent unit, so the player phase ended (turn ${s.turnBefore} -> ${s.turnAfter}).`
+      : s.state === "timeout"
+        ? ` WARNING: unit #${slot} never became spent (${flags}) — something is still on screen; call fe7_unstick.`
+        : canto ? ` ${canto}` : ``;
+  const head = `Unit #${slot}: ${moved}, ${spec.label}`;
+  const text = await readText(m);
+
+  if (action === "visit") {
+    const ok = s.state !== "timeout";
+    return {
+      text:
+        `${head} — ` +
+        (ok ? `VISITED: the visit event ran and unit #${slot} is spent (${flags}).` : `chosen, but the unit never became spent (${flags}).`) +
+        (terrainNote ? ` The village is now CLOSED (${terrainNote}), so it cannot be visited again or destroyed.` : ` Terrain unchanged — a house, which stays open.`) +
+        invNote + joinNote + ending + ` Text buffer: ${JSON.stringify(text)}.`,
+    };
+  }
+  if (action === "door") {
+    const opened = changed.filter((t) => t.a === TERRAIN_DOOR);
+    return {
+      text:
+        `${head} — ` +
+        (opened.length
+          ? `OPENED: ${terrainNote}.`
+          : `chosen, but no adjacent tile stopped being a door${terrainNote ? ` (changed: ${terrainNote})` : ""} — it may not have opened.`) +
+        invNote + ` Unit #${slot} ${flags}.` + ending,
+    };
+  }
+  return {
+    text:
+      `${head} — ` +
+      (changed.length
+        ? `OPENED: ${terrainNote}.`
+        : `chosen, but the chest tile did not change — it may not have opened.`) +
+      invNote + (inv(actorBefore) === inv(self) && changed.length ? ` (A gold chest adds to the party's funds, not the inventory.)` : ``) +
+      ` Unit #${slot} ${flags}.` + ending + ` Text buffer: ${JSON.stringify(text)}.`,
+  };
+}
+
+/** Parameters only the target-selection commands (talk, dance, rescue, …) read. */
+interface ActExtra {
+  targetX: number | null;
+  targetY: number | null;
+  /** Whether the caller named target_faction, as opposed to getting the default. */
+  factionGiven: boolean;
+  cantoX: number | null;
+  cantoY: number | null;
+  giveSlot: number | null;
+  takeSlot: number | null;
+}
+const NO_EXTRA: ActExtra = {
+  targetX: null, targetY: null, factionGiven: false, cantoX: null, cantoY: null, giveSlot: null, takeSlot: null,
+};
+
+/**
+ * fe7_act. A thin wrapper whose one job is the RESUMED case: when the unit's menu
+ * was already open after a free action, B no longer unwinds — it ends the turn —
+ * so a follow-up that is refused still costs the unit its action, and the inner
+ * handlers' "left unspent" wording would then be false. Report what is true.
+ */
 async function fe7Act(
   m: MgbaClient,
   slot: number,
@@ -2090,6 +3081,47 @@ async function fe7Act(
   itemSlot: number | null,
   targetFaction: string,
   weaponSlot: number | null = null,
+  extra: ActExtra = NO_EXTRA,
+): Promise<ActResult> {
+  const ctx = { resumed: false };
+  let r: ActResult;
+  try {
+    r = await fe7ActInner(
+      m, slot, destX, destY, action, targetCycle, targetSlot, itemSlot, targetFaction, weaponSlot, extra, ctx,
+    );
+  } finally {
+    resumedSlot = -1;
+  }
+  if (!ctx.resumed) return r;
+  const v = await readUnit(m, A.playerArray, slot);
+  const low = (v?.flags ?? 0) & 0xff;
+  return {
+    text:
+      r.text +
+      `\n  (This call RESUMED unit #${slot}'s open menu after an earlier free action, so it could not move and a ` +
+      `refusal backs out only as far as that menu. Unit #${slot} is now ` +
+      (v?.acted
+        ? `SPENT`
+        : v?.selected
+          ? `STILL MID-TURN with its menu open at (${v.x},${v.y}) — call fe7_act for it again to finish`
+          : `unspent`) +
+      ` (+0x0C = 0x${hex2(low)}).)`,
+  };
+}
+
+async function fe7ActInner(
+  m: MgbaClient,
+  slot: number,
+  destX: number,
+  destY: number,
+  action: string,
+  targetCycle: number,
+  targetSlot: number | null,
+  itemSlot: number | null,
+  targetFaction: string,
+  weaponSlot: number | null,
+  extra: ActExtra,
+  ctx: { resumed: boolean },
 ): Promise<ActResult> {
   // PRE-FLIGHT. These refusals depend only on the unit's own record, so finding
   // them out AFTER prologue() has already selected the unit and walked it to the
@@ -2142,6 +3174,21 @@ async function fe7Act(
     }
   }
 
+  // A chest opened with a full inventory halts the game on the send/discard list,
+  // where the A that dismisses the "got an item" box would instead throw away the
+  // highlighted entry — the unit's first item. Knowable before it takes a step.
+  if (action === "chest") {
+    const pre = await readUnit(m, A.playerArray, slot);
+    if (pre && pre.items.length >= 5) {
+      return {
+        text:
+          `Unit #${slot} already carries 5 items (${pre.items.map((i) => hex2(i.id)).join(",")}), so a chest's contents would ` +
+          `raise the inventory-full prompt mid-action. Free a slot first (use up or trade away an item), or open it with a ` +
+          `unit that has room. Nothing was moved or pressed; unit #${slot} is unspent at (${pre.x},${pre.y}).`,
+      };
+    }
+  }
+
   // weapon_slot is knowable in full before moving: the slot, its type, the unit's
   // rank in it, and — since the destination is given — whether it reaches anything.
   if (action === "attack" && weaponSlot !== null) {
@@ -2177,7 +3224,15 @@ async function fe7Act(
   const pro = await prologue(m, slot, destX, destY);
   if (!pro.ok) return { text: pro.text };
   const { u, players, enemies, greens, cost, startX, startY } = pro;
+  ctx.resumed = pro.resumed === true;
+  if (ctx.resumed) resumedSlot = slot;
 
+  if (TARGETED_CMD[action] !== undefined) {
+    return targetedAct(m, slot, destX, destY, action, targetSlot, targetFaction, itemSlot, extra, pro);
+  }
+  if (MAP_OBJECT_CMD[action] !== undefined) {
+    return mapObjectAct(m, slot, destX, destY, action, extra, pro);
+  }
 
   if (action === "wait") {
     const w = await commitWait(m, A.playerArray, slot);
@@ -2816,8 +3871,9 @@ async function fe7Act(
 
   return {
     text:
-      `Unknown action "${action}". Verified actions: wait, attack, staff, item, seize. ` +
-      `Shallow-tier (selection verified, outcome UNVERIFIED): visit, door, chest, ride, dismount, status.`,
+      `Unknown action "${action}". Verified actions: wait, attack, staff, item, seize, ` +
+      `talk, dance/play, rescue, drop, take, give, trade, steal, support, visit, door, chest. ` +
+      `Shallow-tier (selection verified, outcome UNVERIFIED): ride, dismount, status.`,
   };
 }
 
@@ -2974,179 +4030,6 @@ async function fe7Forecast(
     `Unit #${slot} moved to (${destX},${destY}) but no menu entry led to a forecast ` +
     `(menu count ${menu.count}; tried ${tried.join(", ") || "nothing"}). Most likely nothing is in range. Nothing changed.`
   );
-}
-
-/**
- * Move one item between two adjacent units.
- *
- * Trade does NOT consume the action — after backing out, +0x0C is still 0x01 and
- * the action menu reopens — so this is free to do before deciding what a unit
- * actually does. That is the whole reason it is its own tool rather than an
- * action on fe7_act, whose contract is "commit this unit's turn".
- *
- * LIMITATION: the two units must ALREADY be adjacent; pass the acting unit's
- * current tile. Trading after a move is not supported, because whether cancelling
- * the move also reverts an already-written trade has not been tested, and
- * guessing wrong would silently corrupt inventories.
- */
-async function fe7Trade(
-  m: MgbaClient,
-  slot: number,
-  partnerSlot: number,
-  giveItemSlot: number,
-): Promise<string> {
-  const players = await readArray(m, A.playerArray);
-  const me = bySlot(players, slot);
-  const partner = bySlot(players, partnerSlot);
-  if (!me) return `No player unit in slot ${slot}.`;
-  if (!partner) return `No player unit in slot ${partnerSlot}.`;
-  if (me.acted) return `Unit #${slot} has already acted.`;
-  const dist = Math.abs(me.x - partner.x) + Math.abs(me.y - partner.y);
-  if (dist !== 1) {
-    return (
-      `Units #${slot} (${me.x},${me.y}) and #${partnerSlot} (${partner.x},${partner.y}) are ${dist} tiles apart; ` +
-      `trade needs them adjacent. Move one with fe7_act first — this tool deliberately does not move units.`
-    );
-  }
-  if (giveItemSlot >= me.items.length) {
-    return `item_slot ${giveItemSlot} is out of range — unit #${slot} carries ${me.items.length} item(s).`;
-  }
-  if (partner.items.length >= 5) {
-    return `Unit #${partnerSlot} already carries 5 items; there is no free slot to receive one.`;
-  }
-
-  const invBefore = async (u: Unit) => (await readRange(m, u.addr + 0x1e, 10)).map(hex2).join(" ");
-  const meBefore = await invBefore(me);
-  const partnerBefore = await invBefore(partner);
-
-  const pro = await prologue(m, slot, me.x, me.y);
-  if (!pro.ok) return pro.text;
-  const { startX, startY } = pro;
-
-  const menu = await locateMenu(m);
-  if (!menu) {
-    await unwind(m, slot, startX, startY);
-    return `Could not locate unit #${slot}'s action menu. Nothing changed.`;
-  }
-
-  for (let cand = menu.count - 2; cand >= 0; cand--) {
-    // Trade sits immediately above Wait when present, so scan upward from the
-    // bottom — everything whose presence we cannot predict (Attack, Staff,
-    // Rescue) sits ABOVE Trade in the fixed order.
-    if (!(await menuGoTo(m, menu.addr, cand, menu.count))) continue;
-    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 24 }]);
-    await sleep(200);
-
-    // The "…unit to trade with." prompt is TRANSIENT — by the time we read the
-    // buffer it has often been overwritten (observed: an item description, then a
-    // weapon name). So identify Trade structurally instead: it is the only entry
-    // at count-2 that opens a unit-target selection rather than a list.
-    const asc = await readText(m);
-    if (/unit to rescue/i.test(asc)) {
-      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
-      await sleep(140);
-      continue;
-    }
-    // In a unit-target selection the MAP CURSOR jumps onto the highlighted unit;
-    // a menu never moves it. That is a cheap, reliable discriminator — and unlike
-    // locateMenu it has no side effects, which matters because locateMenu's own
-    // Down press moves the partner highlight and then finds a false "menu".
-    const cur = await readCursor(m);
-    const onAlly = players.some(
-      (o) => o.slot !== slot && o.deployed && !o.dead && o.x === cur.x && o.y === cur.y,
-    );
-    if (!onAlly) {
-      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 22 }]);
-      await sleep(140);
-      continue;
-    }
-
-    const ptr = await findTargetPointerAddr(m);
-    if (!ptr || !(await cycleToTarget(m, ptr, A.playerArray, partnerSlot))) {
-      await unwind(m, slot, startX, startY);
-      return `Reached trade partner select but could not put the highlight on #${partnerSlot}. Nothing changed.`;
-    }
-    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
-    await sleep(300);
-
-    // The trade screen's two cursor fields live in a dynamically allocated
-    // struct, so find them by what moves. Do NOT reuse a remembered offset: the
-    // trade proc's +0x28 holds the INITIAL partner and then goes stale, which
-    // already fooled one investigation.
-    const findByPress = async (btn: string, back: string): Promise<number | null> => {
-      await m.call("snapshot_memory", { name: "fe7_trade", address: A.uiArena, length: UI_ARENA_LEN });
-      await press(m, [{ buttons: [btn], frames: 4, release_frames: 18 }]);
-      let hit: number | null = null;
-      for (let a = 0; a < 3 && hit === null; a++) {
-        await sleep(a === 0 ? 90 : 160);
-        const d = await m.call<{ changes: unknown }>("diff_memory", {
-          name: "fe7_trade", predicate: "changed", width: 1, max_results: 256,
-        });
-        const ch = asArray<{ address: number; before: number; after: number }>(d.changes);
-        if (ch.length > 0 && ch.length < 30) {
-          const c = ch.find((x) => x.before < 8 && x.after < 8 && x.before !== x.after);
-          if (c) hit = c.address;
-        }
-      }
-      await press(m, [{ buttons: [back], frames: 4, release_frames: 18 }]);
-      return hit;
-    };
-
-    const rowAddr = await findByPress("Down", "Up");
-    const colAddr = await findByPress("Right", "Left");
-    if (rowAddr === null || colAddr === null) {
-      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 24 }]);
-      await unwind(m, slot, startX, startY);
-      return `Opened the trade screen but could not locate its row/column cursor bytes by diff. Backed out; nothing changed.`;
-    }
-
-    // Column 0 is the acting unit's list.
-    for (let g = 0; g < 4; g++) {
-      if ((await readRange(m, colAddr, 1))[0] === 0) break;
-      await press(m, [{ buttons: ["Left"], frames: 4, release_frames: 18 }]);
-      await sleep(70);
-    }
-    for (let g = 0; g < 8; g++) {
-      if ((await readRange(m, rowAddr, 1))[0] === giveItemSlot) break;
-      await press(m, [{ buttons: ["Down"], frames: 4, release_frames: 18 }]);
-      await sleep(70);
-    }
-    if ((await readRange(m, rowAddr, 1))[0] !== giveItemSlot) {
-      await press(m, [{ buttons: ["B"], frames: 4, release_frames: 24 }]);
-      await unwind(m, slot, startX, startY);
-      return `Could not move the trade cursor onto inventory slot ${giveItemSlot}. Backed out; nothing changed.`;
-    }
-
-    // A on one of our items auto-jumps to the partner's column at its first
-    // empty slot; a second A completes the transfer.
-    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 22 }]);
-    await sleep(200);
-    await press(m, [{ buttons: ["A"], frames: 4, release_frames: 22 }]);
-    await sleep(260);
-
-    await press(m, [{ buttons: ["B"], frames: 4, release_frames: 26 }]);
-    await sleep(220);
-
-    const meNow = await readUnit(m, A.playerArray, slot);
-    const partnerNow = await readUnit(m, A.playerArray, partnerSlot);
-    const meAfter = await invBefore(me);
-    const partnerAfter = await invBefore(partner);
-    const changed = meAfter !== meBefore || partnerAfter !== partnerBefore;
-
-    await unwind(m, slot, startX, startY);
-    const spent = meNow?.acted ? " WARNING: the unit is now marked spent, which trade should not do." : "";
-    return (
-      `Trade #${slot} -> #${partnerSlot}, giving inventory slot ${giveItemSlot}.\n` +
-      `  #${slot}        ${meBefore}\n  ->            ${meAfter}\n` +
-      `  #${partnerSlot}        ${partnerBefore}\n  ->            ${partnerAfter}\n` +
-      (changed
-        ? `Inventories changed as expected. Unit #${slot} is still unspent, so it can still act this turn.${spent}`
-        : `NOTHING CHANGED — the trade did not take. Unit #${slot} is unspent; check adjacency and free slots.${spent}`)
-    );
-  }
-
-  await unwind(m, slot, startX, startY);
-  return `No action-menu entry announced itself as Trade (menu count ${menu.count}). Nothing changed.`;
 }
 
 /**
@@ -3674,6 +4557,10 @@ async function fe7EndTurn(m: MgbaClient, timeoutMs: number): Promise<string> {
   lastSnap = await takeSnap(m);
   const baseSnap = lastSnap;
 
+  // A unit left mid-turn by a free action (Take/Give/Trade) still has its menu
+  // open, and the A meant for the field menu would land on it instead.
+  await releaseOtherSelection(m, await readArray(m, A.playerArray), -1);
+
   // The field menu only opens on an EMPTY tile; on a unit, A selects it instead.
   const players = await readArray(m, A.playerArray);
   const enemies = await readArray(m, A.enemyArray);
@@ -3970,7 +4857,7 @@ export const FE7_TOOLS: Tool[] = [
     description:
       "PURPOSE: Read and DECODE the full Fire Emblem 7 battlefield in one call — turn, phase, cursor, and every player and enemy unit with position, HP, stats, items and has-acted status. " +
       "USAGE: Call this instead of dumping the unit arrays with mgba_read_range and decoding 72-byte structs by hand; it replaces ~5KB of hex per turn. Use `brief` for a positions-and-HP-only view when planning movement, and the full view when you need stats to predict combat. " +
-      "BEHAVIOR: Pure read, no side effects and no input. Units are decoded from the player array at 0x0202BD50 and the enemy array at 0x0202CEC0, stopping at the first empty slot. Benched units (x=0xFF) and dead units (current HP 0) are excluded from the listings and summarised as counts. " +
+      "BEHAVIOR: Pure read, no side effects and no input. Units are decoded from the player array at 0x0202BD50 and the enemy array at 0x0202CEC0, stopping at the first empty slot. Benched units (x=0xFF) and dead units (current HP 0) are excluded from the listings and summarised as counts. A rescue pair shares one tile: the carrier's line ends CARRYING <faction> #N and the carried unit's ends CARRIED by <faction> #N — a carried unit is hidden and cannot act until its carrier uses fe7_act action='drop'. " +
       "RETURNS: A header line with turn/phase/cursor, then PLAYERS, ENEMIES and GREEN sections, one line per unit. Every line starts with #N, the ARRAY SLOT — the same number fe7_act's slot and target_slot take, greens included. Every line also carries chNN, the character ID (stable across promotion and roster compaction; NN is the key into byChar in overlay/names.json, without the ch prefix). On ENEMIES and GREEN lines a chNN that is in that table is a NAMED, possibly recruitable character standing among generics of the same class, so check it before attacking. Player and green lines carry rN, the roster byte, which is NOT what any parameter wants. US release only (AGB-AE7E).",
     inputSchema: {
       type: "object",
@@ -4080,29 +4967,61 @@ export const FE7_TOOLS: Tool[] = [
         y: { type: "number", description: "Destination tile y." },
         action: {
           type: "string",
-          enum: ["wait", "attack", "staff", "item", "seize", "visit", "door", "chest", "ride", "dismount", "status"],
+          enum: [
+            "wait", "attack", "staff", "item", "seize",
+            "talk", "dance", "play", "rescue", "drop", "take", "give", "trade", "steal", "support",
+            "visit", "door", "chest", "ride", "dismount", "status",
+          ],
           description:
             "'wait' ends the unit's turn on the destination tile, picked by wrapping the action menu UP to its last entry. That Up is MENU navigation, not a map input: it is verified by re-reading the cursor, because with no menu open it walks the map instead and the A behind it lands on the board. Commit is confirmed by the TURN CLOCK, not by the has-acted flag — if this is the last unspent unit its Wait ends the phase and the new turn clears that flag, which is success, not failure. " +
             "'attack' picks Attack and confirms against a target — pass target_slot to choose which enemy and have the choice VERIFIED before swinging. Pass weapon_slot to swing a specific inventory weapon (the Rapier instead of the equipped Iron Sword); without it the EQUIPPED weapon — inventory slot 0 — is always the one used. " +
             "'staff' heals with a staff: requires target_slot, and item_slot if the unit carries more than one staff. " +
             "'item' uses an item on the unit itself (a vulnerary); item_slot picks which, defaulting to the first. " +
             "'seize' takes a gate or throne with a lord, completing a Seize chapter. The Seize entry is located by READING the menu — each entry's struct carries a ROM pointer identifying its command — so it never presses A on an entry it cannot name. If no Seize entry exists it reports the whole menu's contents and backs out having pressed nothing. " +
+            "TARGET-SELECTION COMMANDS — 'talk', 'dance'/'play', 'rescue', 'drop', 'take', 'give', 'trade', 'steal', 'support'. Each is found on the menu by its ROM command pointer, and its target is chosen from the GAME'S OWN target list, read from memory: the highlight is cycled until it is verified to sit on the unit (or tile) you named, and only then confirmed. Name the target with target_slot (+ target_faction) or target_x/target_y; when the game offers exactly one candidate you may omit it. Asking for a target the game does not offer backs out, unit unspent, and lists who it does offer. If the entry is not on the menu at all, the result prints the menu and what the game requires for that command. " +
+            "'talk' speaks to an adjacent character — this is how most recruits join. The conversation is skipped for you, and the result says whether the character CHANGED SIDES (it looks for their character ID in the player array) and their new player slot. The speaker matters: only the right character gets the Talk entry. " +
+            "'dance' and 'play' are the same action (Ninian dances, Nils plays; either word works for either unit): the adjacent ally you name, which must have ALREADY acted, gets its turn back. Confirmed by the target's has-acted flag clearing. If the dancer carries one of the four rings (Filla's Might, Ninis's Grace, Thor's Ire, Set's Litany) the game asks which to use: omit item_slot for the plain dance, or pass the ring's inventory slot to use the ring instead — a ring buffs the target for a turn and does NOT refresh it. " +
+            "'rescue' picks up an adjacent ally (Con <= this unit's Aid); it rides hidden on this unit's tile until dropped. 'drop' puts the carried unit on an adjacent free tile — pass target_x/target_y for which. 'take' pulls a carried unit off an adjacent ally and 'give' hands yours to one. " +
+            "'steal' (thieves only) takes one ITEM from an adjacent enemy — never a weapon, tome or staff. target_slot is the enemy slot; item_slot is the slot in the ENEMY's inventory as fe7_state lists it, defaulting to the first stealable one. Confirmed by the item appearing in the thief's inventory and leaving the enemy's. " +
+            "'trade' moves items between this unit and an adjacent PLAYER unit (a spent one is fine): item_slot is this unit's slot to GIVE, take_item_slot the partner's slot to TAKE, and both together SWAP the two — the only way to trade when the receiving side already holds five. Both inventories are printed before and after. One trade per unit per turn — the game removes the entry afterwards, so move everything you mean to in that one call. " +
+            "TAKE, GIVE AND TRADE ARE FREE ACTIONS: they do not end the unit's turn. The game reopens that unit's menu and waits, so follow with another fe7_act for the SAME unit at its CURRENT tile (it can no longer move) — wait, drop, attack, item. Acting with a different unit first ends its turn where it stands. " +
+            "MOUNTED UNITS CANTO: after talk, rescue, drop and the like a mounted unit keeps its leftover Move. Pass canto_x/canto_y to ride on to that tile before it waits (rescue-and-retreat); omit them and it waits where it stands. " +
             "SHALLOW TIER — 'visit', 'door', 'chest', 'ride', 'dismount', 'status'. These six are located the same way Seize is, by reading the menu for their ROM command pointer, so nothing is pressed that could not be named first. They are NEW and their outcome is UNVERIFIED: no confirm-by-effect signal is known for any of them yet, so the tool presses A and then REPORTS the before/after delta of the unit record, the turn clock and the tile's terrain rather than claiming success. Read the delta and judge; if the action worked, that delta is the missing signal and is worth a fe7_note. Each backs out to a free cursor with B whatever happens. " +
             "Only 'wait' can end the turn without an effect — the five verified actions confirm they landed and report what changed.",
         },
         target_slot: {
           type: "number",
           description:
-            "Who to act on: the enemy slot for 'attack', the ally slot for 'staff'. The highlighted target is READ BACK from memory and verified before anything is confirmed, so a wrong pick fails loudly instead of hitting the wrong unit. Omit on 'attack' to take the game's default target.",
+            "Who to act on: the enemy slot for 'attack', the ally slot for 'staff', and for the target-selection commands (talk, dance/play, rescue, take, give, support) the slot in whichever array target_faction names. The highlighted target is READ BACK from memory and verified before anything is confirmed, so a wrong pick fails loudly instead of hitting the wrong unit. Omit on 'attack' to take the game's default target, and on a target-selection command when there is only one candidate.",
         },
         target_faction: {
           type: "string",
-          enum: ["player", "green"],
-          description: "Which array target_slot indexes for action='staff'. Defaults to 'player'. Green NPCs are valid staff targets — pass the slot fe7_state prints for them, the #N at the start of each GREEN line (NOT the rN roster byte on the same line).",
+          enum: ["player", "green", "enemy"],
+          description: "Which array target_slot indexes, for 'staff' and the target-selection commands. Defaults to 'player'. Green NPCs are valid staff and talk targets — pass the slot fe7_state prints for them, the #N at the start of each GREEN line (NOT the rN roster byte on the same line). Use 'enemy' to talk to a recruitable enemy. Ignored by 'attack', whose target_slot is always an enemy slot.",
+        },
+        target_x: {
+          type: "number",
+          description: "Target TILE x, for the target-selection commands — an alternative to target_slot that needs no faction, and the only way to say where 'drop' should put the carried unit. Pass with target_y.",
+        },
+        target_y: {
+          type: "number",
+          description: "Target TILE y. Pass with target_x.",
+        },
+        canto_x: {
+          type: "number",
+          description: "For a MOUNTED unit using talk, rescue, drop or support: the tile to ride on to with its leftover Move after the action, before it waits. Pass with canto_y. Checked against the game's cost map for the leftover range; if it is out of reach or occupied the unit waits where it stands and the result says so. Omit to wait in place. Ignored for units on foot.",
+        },
+        canto_y: {
+          type: "number",
+          description: "Canto destination y. Pass with canto_x.",
         },
         item_slot: {
           type: "number",
           description: "Inventory slot (0-based, as listed by fe7_state) of the staff or item to use. Defaults to the first staff for 'staff', and for 'item' to the first CONSUMABLE the unit carries — not slot 0, which is almost always a weapon. A slot holding a weapon or staff is refused by name rather than attempted.",
+        },
+        take_item_slot: {
+          type: "number",
+          description: "For action='trade': the slot in the PARTNER's inventory (0-based, as fe7_state lists it) to take. Alone it moves that item to this unit; together with item_slot the two items swap.",
         },
         target_cycle: {
           type: "number",
@@ -4147,14 +5066,6 @@ export const FE7_TOOLS: Tool[] = [
       required: ["slot", "x", "y"],
     },
   },
-  // fe7_trade is DELIBERATELY NOT REGISTERED. The implementation below is
-  // complete but does not work yet: identifying the Trade entry fails, and live
-  // testing suggests why — pressing A on Trade appears to open the trade SCREEN
-  // directly rather than a partner selection (the ASCII buffer showed an item
-  // name, and the map cursor never moved onto an ally). RAM.md's write-up assumes
-  // a partner-select step with a readable highlight. Rather than ship a tool that
-  // burns calls and returns nothing, this stays unregistered until the flow is
-  // re-derived. Everything else here is tested and working.
   {
     name: "fe7_inventory_full",
     description:
@@ -4337,6 +5248,15 @@ async function dispatchFe7(
             p.item_slot === undefined ? null : Number(p.item_slot),
             p.target_faction === undefined ? "player" : String(p.target_faction),
             p.weapon_slot === undefined ? null : Number(p.weapon_slot),
+            {
+              targetX: p.target_x === undefined ? null : Number(p.target_x),
+              targetY: p.target_y === undefined ? null : Number(p.target_y),
+              factionGiven: p.target_faction !== undefined,
+              cantoX: p.canto_x === undefined ? null : Number(p.canto_x),
+              cantoY: p.canto_y === undefined ? null : Number(p.canto_y),
+              giveSlot: null,
+              takeSlot: p.take_item_slot === undefined ? null : Number(p.take_item_slot),
+            },
           )
         ).text,
       );
@@ -4350,9 +5270,6 @@ async function dispatchFe7(
           p.weapon_slot === undefined ? null : Number(p.weapon_slot),
         ),
       );
-
-    case "fe7_trade":
-      return wrap(await fe7Trade(m, Number(p.slot), Number(p.partner_slot), Number(p.item_slot)));
 
     case "fe7_unstick": {
       const r = await fe7Unstick(m);

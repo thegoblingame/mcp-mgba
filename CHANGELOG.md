@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Thirteen more `fe7_act` actions, each confirmed by effect**: `talk`, `dance` /
+  `play` (with the dancer's-ring sub-menu), `rescue`, `drop`, `take`, `give`,
+  `trade`, `steal`, `support`, and verdicts for `visit`, `door` and `chest`, which
+  previously reported a raw delta. Targets are chosen from the game's own target
+  list (`0x0203DCF8`), gated on the selection proc, so a wrong or unavailable
+  target backs out with the unit unspent and names who the game does offer.
+  New parameters: `target_x`/`target_y`, `target_faction: 'enemy'`,
+  `canto_x`/`canto_y` (a mounted unit's leftover move after the action) and
+  `take_item_slot` (trade).
+- **Free actions resume.** `take`, `give` and `trade` leave the unit's menu open;
+  the next `fe7_act` for that unit picks the menu up where it is instead of
+  re-selecting, and acting with another unit (or ending the turn) releases it.
+- **`fe7_state` tags rescue pairs** `CARRYING` / `CARRIED by`, and a carried unit
+  no longer counts as occupying its carrier's tile.
+
+### Removed
+
+- The unregistered `fe7_trade` implementation, superseded by `fe7_act(action:'trade')`.
+
 - **`reason` parameter on `fe7_act` and `fe7_end_turn`** (required). One sentence
   from the model explaining the action it is about to commit, or why the turn is
   ready to end. Not acted on; recorded verbatim in the run log's `params` so the
