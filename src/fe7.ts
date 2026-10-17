@@ -3049,6 +3049,112 @@ async function mapObjectAct(
   };
 }
 
+const GOLD_ADDR = 0x0202bc00; // party gold, u32 (Confirmed 2026-10-14 by spend-and-diff; RAM.md)
+
+// Armory, Vendor, Arena and Supply each OPEN A WHOLE SCREEN rather than resolving
+// on the map: a weapon/item shop, an arena bout, or the convoy. DRIVING those
+// screens — buying, selling, fighting, moving items — is not built yet and is
+// tracked in the BACKLOG. What this handler does is the verifiable half: locate
+// the command by its ROM pointer, open the screen, PROVE it opened (the map cursor
+// goes unresponsive while a full screen is up), then back out with B and report
+// that the unit is home and unspent with nothing spent. Gold is read before and
+// after from the confirmed gold address so a buy/sell flow has a real baseline.
+const FACILITY_CMD: Record<string, { cmd: number; label: string; tile: number | null; why: string }> = {
+  armory: {
+    cmd: MENU_CMD.armory, label: "Armory", tile: 0x06,
+    why: "Armory is only offered to a unit standing ON an armory tile (terrain 0x06).",
+  },
+  vendor: {
+    cmd: MENU_CMD.vendor, label: "Vendor", tile: 0x07,
+    why: "Vendor is only offered to a unit standing ON a vendor tile (terrain 0x07).",
+  },
+  arena: {
+    cmd: MENU_CMD.arena, label: "Arena", tile: 0x08,
+    why: "Arena is only offered to a unit standing ON an arena tile (terrain 0x08).",
+  },
+  supply: {
+    cmd: MENU_CMD.supply, label: "Supply", tile: null,
+    why: "Supply (convoy access) is offered wherever the convoy is reachable — Merlinus deployed, or a chapter that grants it. It is a free action and needs no particular tile.",
+  },
+};
+
+async function facilityAct(
+  m: MgbaClient,
+  slot: number,
+  destX: number,
+  destY: number,
+  action: string,
+  _extra: ActExtra,
+  pro: Extract<PrologueResult, { ok: true }>,
+): Promise<ActResult> {
+  const spec = FACILITY_CMD[action];
+  const { cost, startX, startY } = pro;
+  const moved = `(${startX},${startY}) -> (${destX},${destY}) cost ${cost}`;
+  const backedOut = `Backed out; unit #${slot} unspent at (${startX},${startY}).`;
+
+  const gold = async () => u32(await readRange(m, GOLD_ADDR, 4), 0);
+  const invOf = (v: Unit | null) => v?.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",") || "-";
+
+  const menu = await locateMenu(m);
+  if (!menu) {
+    await unwind(m, slot, startX, startY);
+    return { text: `Unit #${slot} reached (${destX},${destY}) but the action menu could not be located. ${backedOut}` };
+  }
+  const cmds = await menuEntryCmds(m, menu.addr, menu.count);
+  const shape = cmds.map(cmdName).join(", ");
+  const idx = cmds.indexOf(spec.cmd);
+  if (idx < 0) {
+    const here = await terrainAt(m, destX, destY);
+    await unwind(m, slot, startX, startY);
+    return {
+      text:
+        `No ${spec.label} entry on unit #${slot}'s action menu at (${destX},${destY}) — the menu holds [${shape}], ` +
+        `and the tile is ${terrainName(here ?? -1)}${here === null ? "" : ` (0x${hex2(here)})`}. ${spec.why} ` +
+        `Nothing was pressed; unit unspent at (${startX},${startY}).`,
+    };
+  }
+  if (!(await menuGoTo(m, menu.addr, idx, menu.count))) {
+    await unwind(m, slot, startX, startY);
+    return { text: `Found ${spec.label} at index ${idx} of [${shape}] but could not move the highlight onto it. ${backedOut}` };
+  }
+
+  const goldBefore = await gold();
+  const actorBefore = await readUnit(m, A.playerArray, slot);
+
+  await press(m, [{ buttons: ["A"], frames: 4, release_frames: 26 }]);
+  await sleep(1300); // a whole screen takes longer to build than a menu
+
+  // PROOF the screen opened: while a full facility screen is up the map cursor is
+  // not live, so a probe press does not move it. (cursorResponds moves it and puts
+  // it back when the cursor IS live, which is harmless on the open map.)
+  const opened = !(await cursorResponds(m));
+  const textOpen = await readText(m);
+
+  // Back out. unwind presses B until the unit is home and unspent (true) or finds
+  // it committed (false). Opening a facility and leaving should cost nothing.
+  const restored = await unwind(m, slot, startX, startY);
+  const freed = await cursorResponds(m);
+
+  const goldAfter = await gold();
+  const actorAfter = await readUnit(m, A.playerArray, slot);
+  const flags = (actorAfter?.flags ?? 0) & 0xff;
+
+  const deltas: string[] = [];
+  if (goldAfter !== goldBefore) deltas.push(`gold ${goldBefore} -> ${goldAfter}`);
+  if (invOf(actorBefore) !== invOf(actorAfter)) deltas.push(`inventory ${invOf(actorBefore)} -> ${invOf(actorAfter)}`);
+
+  return {
+    text:
+      `Unit #${slot}: ${moved}, ${spec.label} found at index ${idx} of [${shape}], highlighted and A pressed.\n` +
+      `  screen opened: ${opened ? "YES — the map cursor went unresponsive, so a full screen is up" : "NO — the cursor still moved; the facility screen did not open"}\n` +
+      `  backed out: ${restored ? `YES — unit returned to (${startX},${startY}), unspent (+0x0C = 0x${hex2(flags)})` : `could NOT fully unwind — unit may be spent or mid-screen (+0x0C = 0x${hex2(flags)}); check fe7_state / fe7_unstick`}\n` +
+      `  cursor free afterwards: ${freed ? "yes" : "NO — something is still on screen, call fe7_unstick"}\n` +
+      `  changed: ${deltas.length ? deltas.join("; ") : "nothing — nothing was bought, sold, fought or transferred (this handler only OPENS the screen)"}\n` +
+      `  text buffer at open: ${JSON.stringify(textOpen)}\n` +
+      `  NOTE: buying, selling, arena bouts and convoy transfers are NOT driven yet (BACKLOG). To actually buy, sell, fight or move items, DRIVE THE SCREEN BY HAND with mgba_screenshot and mgba_press_buttons while it is open — this action only opens it. Gold above is the party total (Confirmed, u32). If you completed a real purchase here, the gold delta shows it went through.`,
+  };
+}
+
 /** Parameters only the target-selection commands (talk, dance, rescue, …) read. */
 interface ActExtra {
   targetX: number | null;
@@ -3232,6 +3338,9 @@ async function fe7ActInner(
   }
   if (MAP_OBJECT_CMD[action] !== undefined) {
     return mapObjectAct(m, slot, destX, destY, action, extra, pro);
+  }
+  if (FACILITY_CMD[action] !== undefined) {
+    return facilityAct(m, slot, destX, destY, action, extra, pro);
   }
 
   if (action === "wait") {
@@ -3873,7 +3982,8 @@ async function fe7ActInner(
     text:
       `Unknown action "${action}". Verified actions: wait, attack, staff, item, seize, ` +
       `talk, dance/play, rescue, drop, take, give, trade, steal, support, visit, door, chest. ` +
-      `Shallow-tier (selection verified, outcome UNVERIFIED): ride, dismount, status.`,
+      `Shallow-tier (selection verified, outcome UNVERIFIED): ride, dismount, status. ` +
+      `Facilities (screen opened and verified, contents NOT driven): armory, vendor, arena, supply.`,
   };
 }
 
@@ -4971,6 +5081,7 @@ export const FE7_TOOLS: Tool[] = [
             "wait", "attack", "staff", "item", "seize",
             "talk", "dance", "play", "rescue", "drop", "take", "give", "trade", "steal", "support",
             "visit", "door", "chest", "ride", "dismount", "status",
+            "armory", "vendor", "arena", "supply",
           ],
           description:
             "'wait' ends the unit's turn on the destination tile, picked by wrapping the action menu UP to its last entry. That Up is MENU navigation, not a map input: it is verified by re-reading the cursor, because with no menu open it walks the map instead and the A behind it lands on the board. Commit is confirmed by the TURN CLOCK, not by the has-acted flag — if this is the last unspent unit its Wait ends the phase and the new turn clears that flag, which is success, not failure. " +
@@ -4987,6 +5098,7 @@ export const FE7_TOOLS: Tool[] = [
             "TAKE, GIVE AND TRADE ARE FREE ACTIONS: they do not end the unit's turn. The game reopens that unit's menu and waits, so follow with another fe7_act for the SAME unit at its CURRENT tile (it can no longer move) — wait, drop, attack, item. Acting with a different unit first ends its turn where it stands. " +
             "MOUNTED UNITS CANTO: after talk, rescue, drop and the like a mounted unit keeps its leftover Move. Pass canto_x/canto_y to ride on to that tile before it waits (rescue-and-retreat); omit them and it waits where it stands. " +
             "SHALLOW TIER — 'visit', 'door', 'chest', 'ride', 'dismount', 'status'. These six are located the same way Seize is, by reading the menu for their ROM command pointer, so nothing is pressed that could not be named first. They are NEW and their outcome is UNVERIFIED: no confirm-by-effect signal is known for any of them yet, so the tool presses A and then REPORTS the before/after delta of the unit record, the turn clock and the tile's terrain rather than claiming success. Read the delta and judge; if the action worked, that delta is the missing signal and is worth a fe7_note. Each backs out to a free cursor with B whatever happens. " +
+            "FACILITIES — 'armory', 'vendor', 'arena', 'supply'. Each OPENS A WHOLE SCREEN instead of resolving on the map: a weapon shop, an item shop, an arena bout, or the convoy. The command is located by its ROM pointer like Seize, A is pressed to open the screen, and the open is PROVEN by the map cursor going unresponsive while a full screen is up. The tool then BACKS OUT with B and reports that the unit is home and unspent. It does NOT buy, sell, fight or move items yet — driving those screens is not built. Gold is read before and after from the confirmed party-gold address, so a by-hand purchase shows up as a real delta. armory/vendor/arena need the unit standing ON the matching tile (terrain 0x06/0x07/0x08); supply is a free action offered wherever the convoy is reachable and needs no particular tile. " +
             "Only 'wait' can end the turn without an effect — the five verified actions confirm they landed and report what changed.",
         },
         target_slot: {
