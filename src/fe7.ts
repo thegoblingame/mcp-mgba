@@ -2046,6 +2046,11 @@ async function fe7State(m: MgbaClient, brief: boolean): Promise<string> {
   const L: string[] = [];
   L.push(`Turn ${turn} | phase ${PHASE_NAME[phase] ?? `0x${hex2(phase)}`} | cursor (${cur.x},${cur.y})`);
   L.push(`players deployed ${live.length}/${players.length}  enemies alive ${foes.length}/${enemies.length}  green ${npcs.length}`);
+  if (phase === 0x40 && turn === 0) {
+    // On prep, "deployed" here means "holds a map position", which a toggle does not
+    // change until Start. fe7_prep_select_units reads the flag the game actually uses.
+    L.push(`PREPARATIONS SCREEN: the PLAYERS list below is stale for anything deployed or benched this prep. Use fe7_prep_select_units status to see and change the line-up.`);
+  }
 
   L.push(`PLAYERS:`);
   for (const u of live) {
@@ -4959,7 +4964,532 @@ async function verifyThreat(
     : `VERIFY E#${slot}: game grid and fill agree on every tile (${gameReach} reachable). (Selected with A, backed out with B; cursor left on (${e.x},${e.y}).)`;
 }
 
+// ── Preparations: deploy / bench by direct write ───────────────────────────
+//
+// Deployment is ONE BIT per unit: +0x0C bit 3 set = benched. Pick Units' A press XORs
+// bits 1 and 3 together, and writing the same change with Pick Units CLOSED is honoured
+// at Start — proven on Ch.7x, Ch.31x and Ch.28 (RAM.md, "The Preparations screen"). So
+// this tool never navigates the unit list; it writes exactly what the UI would write and
+// enforces, itself, the three rules the UI would have enforced:
+//
+//   1. Who may be deployed. The Pick Units list is NOT the whole array: on Ch.28 it left
+//      out Merlinus (bit 0 clear), five units with bit 2 set and Nils (0x04210009). A
+//      bit-2 unit written to "deployed" was simply not placed at Start (Erk, 2026-11-08),
+//      so the write is wasted rather than harmful — but it is refused all the same. An
+//      ALLOWLIST of flag bits, not a denylist: an unknown bit fails safe.
+//   2. How many. The cap is only readable inside Pick Units, but every unit holding a
+//      start tile keeps its map x through prep (a toggle does not move x), so counting
+//      listable units with x != 0xFF gives the number of start tiles without opening
+//      anything. Inferred; it matched the game's "14/14" on Ch.28, and `start` reports
+//      anyone the game drops, so a wrong count shows up instead of hiding.
+//   3. Who may not be benched. The game greys a forced unit's name; nothing readable
+//      marks it. That list is human-maintained in llm_plays_fe7/required_units.json,
+//      keyed by the chapter index at 0x0202BC06. A chapter missing from it falls back to
+//      protecting every lord, because benching a forced lord is the one unknown outcome.
+//
+// Writes happen only on the prep TOP menu, recognised by its help text: under an open
+// Pick Units screen the screen's own deployed-count desyncs from the array and can strand
+// a unit on the bench (RAM.md, Ch.31x).
+
+const CHAPTER_INDEX_ADDR = 0x0202bc06; // gPlaySt+0x06 — FE8's PlaySt.chapterIndex with the 8 timer bytes removed
+// gPlaySt+0x13 — FE8's chapterModeIndex (+0x1B) less the same 8 bytes. 2 in every Eliwood-mode
+// save tested and 3 in every Hector-mode one, each matching the lord the game greys out.
+const GAME_MODE_ADDR = 0x0202bc13;
+const MODE_NAME: Record<number, string> = { 1: "lyn", 2: "eliwood", 3: "hector" };
+const KNOWLEDGE_DIR = process.env.FE7_KNOWLEDGE_DIR ?? `${process.env.HOME}/Desktop/repos/llm_plays_fe7`;
+const REQUIRED_UNITS_FILE = process.env.FE7_REQUIRED_UNITS ?? join(KNOWLEDGE_DIR, "required_units.json");
+const NAMES_FILE = join(KNOWLEDGE_DIR, "overlay", "names.json");
+
+const NOT_DEPLOYED_BIT = 0x08;
+const PICK_TOGGLE_BITS = 0x0a; // what one Pick Units A press flips
+// Every bit seen on a unit the Pick Units list actually offered: 0 (always set in prep),
+// 1+3 (toggle), 13 (Eliwood, Ch.28), 21 (0x0020 high half), 22 (Lyn mode's 0x0040).
+const PREP_LISTABLE_BITS = 0x01 | 0x02 | 0x08 | 0x2000 | 0x00200000 | 0x00400000;
+// The lords, by character ID (ROM constants, not per chapter). Lyn has two: Lyn's tale and main story.
+const LORD_CHARS = new Map([[0x01, "Eliwood"], [0x02, "Hector"], [0x03, "Lyn"], [0x2d, "Lyn"]]);
+// Normalised (letters only, lower case) starts of the top menu's help texts. Seen: Ch.7x
+// (Pick Units, Trade, Fortune-disabled, Check Map, Save) and Ch.28 (Pick Units, Items,
+// battle info, Check Map, Save). Pick Units' own header overwrites this to "Pick ...".
+const PREP_MENU_HELP = ["selectwhichunits", "manageyourunits", "valuablebattle", "viewthemap", "saveanychanged", "thiscommandcannot"];
+
+const PROMPT_SETTLE_MS = 800;
+
+/**
+ * The text buffer without stopping at NUL. The Merlinus prompt renders "Deploy
+ * Merlinus?", then "Yes", then "No" into the same buffer, each NUL-terminated, so a
+ * normal read ends up seeing just "No" — but the question survives past the NUL.
+ */
+async function readRawText(m: MgbaClient, len = 64): Promise<string> {
+  const b = await readRange(m, A.textBuf, len);
+  return b.map((c) => (c >= 0x20 && c < 0x7f ? String.fromCharCode(c) : ".")).join("");
+}
+
+/** Why the game would not field this unit, or null if Pick Units would offer it. */
+function prepUnlistable(u: Unit): string | null {
+  const f = u.flags;
+  const raw = `flags 0x${f.toString(16).padStart(8, "0")}`;
+  if (f & 0x04) return `bit 2 set (${raw}) — the game leaves these off the map even when flagged; probably dead`;
+  if (f & 0x00010000) return `bit 16 set (${raw}) — away from the party`;
+  if (!(f & 0x01)) {
+    return u.charId === 0x28
+      ? `not in the Pick Units list (${raw}); Merlinus is fielded only by answering the "Deploy Merlinus?" prompt — fe7_prep_select_units start with merlinus: true`
+      : `bit 0 clear (${raw}) — not in the Pick Units list`;
+  }
+  const odd = f & ~PREP_LISTABLE_BITS;
+  if (odd) return `flag bits 0x${(odd >>> 0).toString(16)} (${raw}) never seen on a deployable unit — refusing rather than guessing`;
+  return null;
+}
+
+async function loadNames(): Promise<Map<number, string>> {
+  const out = new Map<number, string>();
+  try {
+    const raw = JSON.parse(await readFile(NAMES_FILE, "utf8")) as { byChar?: Record<string, { name?: string }> };
+    for (const [k, v] of Object.entries(raw.byChar ?? {})) {
+      if (v?.name) out.set(parseInt(k, 16), v.name);
+    }
+  } catch {
+    // Names are a convenience for reading; chNN still identifies every unit.
+  }
+  return out;
+}
+
+interface Required {
+  ids: Set<number>;
+  /** How the list was arrived at, printed so the caller can see whether it came from the file. */
+  source: string;
+  chapterName: string | null;
+  /** A broken file or an unresolvable name: set and start refuse while this is non-null. */
+  error: string | null;
+  /** The file's deployment limits for this chapter and mode (normal, hard), for cross-checking. */
+  limits: Record<string, number> | null;
+  /** The file's evidence that this index was read from a real save, or null if it was counted. */
+  indexVerified: string | null;
+}
+
+/** Resolve "Hector", "ch02" or "0x02" to character IDs. Names can map to several (Lyn). */
+function resolveCharRef(ref: string, names: Map<number, string>): number[] {
+  const s = ref.trim();
+  const m = /^(?:ch|0x)([0-9a-f]{1,2})$/i.exec(s);
+  if (m) return [parseInt(m[1], 16)];
+  const want = s.toLowerCase();
+  return [...names].filter(([, n]) => n.toLowerCase() === want).map(([id]) => id);
+}
+
+/**
+ * required_units.json: { "chapters": { "0x17": { "name": "...", "required": [...],
+ * "eliwood": [...], "hector": [...], "lyn": [...] } } }. One chapter index covers the same
+ * map in every mode, but the game's lock differs by mode (Dread Isle greys Eliwood in
+ * Eliwood mode), so the list in force is `required` (every mode) plus the current mode's.
+ */
+// The lord of each mode, by character ID. Whatever required_units.json says, the current
+// mode's lord is never benched: the file is partly agent-written, and benching a forced lord
+// is the one outcome nobody has tested.
+const MODE_LORD: Record<number, number[]> = { 1: [0x03, 0x2d], 2: [0x01], 3: [0x02] };
+
+async function loadRequired(chapter: number, mode: number, names: Map<number, string>): Promise<Required> {
+  const r = await loadRequiredFile(chapter, mode, names);
+  for (const id of MODE_LORD[mode] ?? [...LORD_CHARS.keys()]) r.ids.add(id);
+  return r;
+}
+
+async function loadRequiredFile(chapter: number, mode: number, names: Map<number, string>): Promise<Required> {
+  const lords = new Set(LORD_CHARS.keys());
+  let text: string;
+  try {
+    text = await readFile(REQUIRED_UNITS_FILE, "utf8");
+  } catch {
+    return {
+      ids: lords, chapterName: null, error: null, limits: null, indexVerified: null,
+      source: `${REQUIRED_UNITS_FILE} not found — protecting every lord (Eliwood, Hector, Lyn)`,
+    };
+  }
+  let parsed: { chapters?: Record<string, Record<string, unknown>> };
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return {
+      ids: lords, chapterName: null, source: REQUIRED_UNITS_FILE, limits: null, indexVerified: null,
+      error: `${REQUIRED_UNITS_FILE} is not valid JSON (${e instanceof Error ? e.message : e}) — fix it; nothing is written while the required list is unreadable.`,
+    };
+  }
+  const entry = Object.entries(parsed.chapters ?? {}).find(([k]) => Number(k) === chapter)?.[1];
+  if (!entry) {
+    return {
+      ids: lords, chapterName: null, error: null, limits: null, indexVerified: null,
+      source: `chapter 0x${hex2(chapter)} has no entry in ${REQUIRED_UNITS_FILE} — protecting every lord (Eliwood, Hector, Lyn) until one is added`,
+    };
+  }
+  const modeName = MODE_NAME[mode];
+  const limitTable = entry.deployment_limit as Record<string, Record<string, number>> | undefined;
+  const limits = (modeName && limitTable?.[modeName]) || null;
+  const indexVerified = typeof entry.index_verified === "string" ? entry.index_verified : null;
+  // An unrecognised mode byte takes every list: refusing too much beats benching a lock.
+  const keys = modeName ? ["required", modeName] : ["required", ...Object.values(MODE_NAME)];
+  const lists = keys.filter((k) => Array.isArray(entry[k]));
+  if (lists.length === 0) {
+    return {
+      ids: lords, chapterName: typeof entry.name === "string" ? entry.name : null, error: null, limits, indexVerified,
+      source:
+        `chapter 0x${hex2(chapter)} in ${REQUIRED_UNITS_FILE} has no "required" list and no "${modeName ?? `mode ${mode}`}" list — ` +
+        `protecting every lord (Eliwood, Hector, Lyn) until one is added`,
+    };
+  }
+  const ids = new Set<number>();
+  const unknown: string[] = [];
+  for (const ref of lists.flatMap((k) => entry[k] as unknown[])) {
+    const hit = resolveCharRef(String(ref), names);
+    if (hit.length === 0) unknown.push(String(ref));
+    for (const id of hit) ids.add(id);
+  }
+  return {
+    ids, chapterName: typeof entry.name === "string" ? entry.name : null, limits, indexVerified,
+    source: `${REQUIRED_UNITS_FILE}, chapter 0x${hex2(chapter)}, lists ${lists.map((k) => `"${k}"`).join(" + ")}`,
+    error: unknown.length
+      ? `${REQUIRED_UNITS_FILE} chapter 0x${hex2(chapter)} names ${unknown.map((s) => JSON.stringify(s)).join(", ")}, which match no character in ${NAMES_FILE}. ` +
+        `Use the name exactly as names.json spells it, or chNN. Nothing is written while a required unit cannot be identified.`
+      : null,
+  };
+}
+
+interface PrepView {
+  chapter: number;
+  mode: number;
+  players: Unit[];
+  names: Map<number, string>;
+  required: Required;
+  help: string;
+  onTopMenu: boolean;
+  merlinusPrompt: boolean;
+  startTiles: number;
+}
+
+async function readPrep(m: MgbaClient): Promise<{ view: PrepView | null; refusal: string | null }> {
+  const ps = await readRange(m, CHAPTER_INDEX_ADDR, 0x0e);
+  const [chapter, phase, turn] = ps;
+  const mode = ps[GAME_MODE_ADDR - CHAPTER_INDEX_ADDR];
+  if (phase !== 0x40 || turn !== 0) {
+    return {
+      view: null,
+      refusal: `Not on the Preparations screen: phase 0x${hex2(phase)}, turn ${turn} (prep is phase 0x40 with turn 0). Nothing was read or written.`,
+    };
+  }
+  const [players, names, help] = await Promise.all([readArray(m, A.playerArray), loadNames(), readText(m)]);
+  const norm = help.toLowerCase().replace(/[^a-z]/g, "");
+  return {
+    refusal: null,
+    view: {
+      chapter, mode, players, names, help,
+      required: await loadRequired(chapter, mode, names),
+      onTopMenu: PREP_MENU_HELP.some((p) => norm.startsWith(p)),
+      merlinusPrompt: (await readRawText(m)).includes("Merlinus?"),
+      startTiles: players.filter((u) => !prepUnlistable(u) && u.x !== 0xff).length,
+    },
+  };
+}
+
+/**
+ * Second look before writing or pressing Start. A sub-screen opened a moment ago can still
+ * show the top menu's help text (A on Items read "Manage your…" for ~250 ms before the
+ * first unit name replaced it), so one matching read is not proof. Returns a refusal or null.
+ */
+async function prepStillOnTopMenu(m: MgbaClient, verb: string): Promise<string | null> {
+  await sleep(300);
+  const help = await readText(m);
+  const norm = help.toLowerCase().replace(/[^a-z]/g, "");
+  if (PREP_MENU_HELP.some((p) => norm.startsWith(p))) return null;
+  return `fe7_prep_select_units ${verb} refused — the screen changed while checking: help text now reads ${JSON.stringify(help)}, so a sub-screen is opening. Press B until the top menu is back. Nothing was ${verb === "set" ? "written" : "pressed"}.`;
+}
+
+const prepDeployed = (u: Unit) => !prepUnlistable(u) && (u.flags & NOT_DEPLOYED_BIT) === 0;
+
+function prepName(u: Unit, names: Map<number, string>): string {
+  return names.get(u.charId) ?? `ch${hex2(u.charId)}`;
+}
+
+function prepLine(u: Unit, v: PrepView): string {
+  const items = u.items.map((i) => `${hex2(i.id)}x${i.uses}`).join(",");
+  const req = v.required.ids.has(u.charId) ? " REQUIRED" : "";
+  return (
+    `  #${u.slot} ch${hex2(u.charId)} ${prepName(u, v.names)} cls${hex2(u.classId)} Lv${u.level} HP${u.hp}/${u.maxHp}` +
+    ` S${u.str} K${u.skl} P${u.spd} D${u.def} R${u.res} L${u.lck}${req}` + (items ? ` [${items}]` : "")
+  );
+}
+
+/**
+ * Cross-check the counted start tiles against the file's deployment limits. Difficulty is
+ * not readable, so a match with either one passes. A mismatch most likely means the
+ * chapter-index mapping in the generator is wrong for this chapter — or the roster is
+ * smaller than the limit, which the count cannot tell apart, so the message says both.
+ */
+function prepLimitCheck(v: PrepView): string[] {
+  const lim = v.required.limits;
+  if (!lim) return [];
+  const pairs = Object.entries(lim).map(([d, n]) => `${n} (${d})`).join(", ");
+  const listable = v.players.filter((u) => !prepUnlistable(u)).length;
+  if (Object.values(lim).includes(v.startTiles)) {
+    return [`limit check: ${v.startTiles} start tiles matches required_units.json's ${pairs}${v.required.indexVerified ? "" : " — this chapter's index can now be marked verified in scripts/build_required_units.py"}`];
+  }
+  return [
+    `limit check: WARNING — counted ${v.startTiles} start tiles, but required_units.json says ${pairs} for this chapter. ` +
+    (listable <= v.startTiles
+      ? `The roster has only ${listable} fieldable units, which may be all that limits it — likely fine.`
+      : `The chapter-index mapping for 0x${hex2(v.chapter)} is probably wrong, so the REQUIRED list may be for another chapter. Check the chapter name above against the screen, and fe7_note it.`),
+  ];
+}
+
+function prepHeader(v: PrepView): string[] {
+  const deployed = v.players.filter(prepDeployed).length;
+  return [
+    `PREPARATIONS — chapter index 0x${hex2(v.chapter)}${v.required.chapterName ? ` (${v.required.chapterName})` : ""}, ` +
+      `${MODE_NAME[v.mode] ? `${MODE_NAME[v.mode]} mode` : `UNKNOWN mode byte ${v.mode}`}`,
+    `deployed ${deployed} / ${v.startTiles} start tiles (inferred: listable units holding a map position)`,
+    `required units: ${v.required.source}` + (v.required.error ? `\n  ERROR: ${v.required.error}` : ""),
+    ...prepLimitCheck(v),
+    v.merlinusPrompt
+      ? `screen: the "Deploy Merlinus?" prompt is up — call fe7_prep_select_units start to answer it`
+      : v.onTopMenu
+        ? `screen: Preparations top menu (safe to write)`
+        : `screen: NOT the Preparations top menu — help text reads ${JSON.stringify(v.help)}. Press B until the top menu is back before set or start.`,
+  ];
+}
+
+function fe7PrepStatus(v: PrepView): string {
+  const L = prepHeader(v);
+  const deployed = v.players.filter(prepDeployed);
+  const benched = v.players.filter((u) => !prepUnlistable(u) && !prepDeployed(u));
+  // Merlinus is not "undeployable": the game fields him through its own prompt at Start,
+  // on a tile of his own, so he is a choice for `start`, not for `set`.
+  const convoy = v.players.find((u) => u.charId === 0x28 && !(u.flags & 0x00010004));
+  const other = v.players.filter((u) => prepUnlistable(u) && u !== convoy);
+  L.push(`DEPLOYED (${deployed.length}):`, ...deployed.map((u) => prepLine(u, v)));
+  L.push(`BENCHED, deployable (${benched.length}):`, ...benched.map((u) => prepLine(u, v)));
+  if (convoy) {
+    L.push(
+      `CONVOY — your call at start: ${prepLine(convoy, v).trim()}\n` +
+      `  Merlinus is not in Pick Units; fe7_prep_select_units start asks the game's "Deploy Merlinus?" and answers with \`merlinus\`. ` +
+      `He gets his own tile (no start tile used) and lets adjacent units use Supply, but cannot fight and must be protected.`,
+    );
+  }
+  if (other.length) {
+    L.push(`NOT DEPLOYABLE — the game will not field these:`);
+    for (const u of other) L.push(`  #${u.slot} ch${hex2(u.charId)} ${prepName(u, v.names)}: ${prepUnlistable(u)}`);
+  }
+  const missing = v.players.filter((u) => v.required.ids.has(u.charId) && !prepUnlistable(u) && !prepDeployed(u));
+  if (missing.length) {
+    L.push(`WARNING: required but benched — ${missing.map((u) => prepName(u, v.names)).join(", ")}. fe7_prep_select_units start refuses until they are deployed.`);
+  }
+  L.push(`Slots are array slots and are valid until the chapter starts; Start re-sorts the array.`);
+  return L.join("\n");
+}
+
+/** Resolve one caller reference — slot number, "chNN" or a name — to a roster unit. */
+function prepResolve(ref: unknown, v: PrepView): { u: Unit } | { err: string } {
+  if (typeof ref === "number" || /^\d+$/.test(String(ref).trim())) {
+    const slot = Number(ref);
+    const u = bySlot(v.players, slot);
+    return u ? { u } : { err: `slot ${slot} is empty` };
+  }
+  const ids = resolveCharRef(String(ref), v.names);
+  const hits = v.players.filter((u) => ids.includes(u.charId));
+  if (hits.length === 1) return { u: hits[0] };
+  if (hits.length === 0) return { err: `${JSON.stringify(ref)} matches no unit in the roster` };
+  return { err: `${JSON.stringify(ref)} matches ${hits.length} units (${hits.map((u) => `#${u.slot}`).join(", ")}) — pass a slot` };
+}
+
+async function fe7PrepSet(m: MgbaClient, v: PrepView, deployRefs: unknown[], benchRefs: unknown[]): Promise<string> {
+  if (v.required.error) return `fe7_prep_select_units set refused: ${v.required.error}`;
+  if (!v.onTopMenu) return `fe7_prep_select_units set refused — ${prepHeader(v).find((l) => l.startsWith("screen: "))!.replace(/^screen: /, "")} Nothing was written.`;
+  if (deployRefs.length + benchRefs.length === 0) return `fe7_prep_select_units set needs \`deploy\` and/or \`bench\`: lists of slots, names or chNN. Nothing was written.`;
+
+  const problems: string[] = [];
+  const pick = (refs: unknown[]) => {
+    const out: Unit[] = [];
+    for (const r of refs) {
+      const hit = prepResolve(r, v);
+      if ("err" in hit) problems.push(hit.err);
+      else out.push(hit.u);
+    }
+    return out;
+  };
+  const toDeploy = pick(deployRefs);
+  const toBench = pick(benchRefs);
+  for (const u of toDeploy) {
+    if (toBench.some((b) => b.slot === u.slot)) problems.push(`${prepName(u, v.names)} (#${u.slot}) is in both deploy and bench`);
+    const why = prepUnlistable(u);
+    if (why) problems.push(`cannot deploy ${prepName(u, v.names)} (#${u.slot}): ${why}`);
+  }
+  for (const u of toBench) {
+    if (v.required.ids.has(u.charId)) {
+      problems.push(`cannot bench ${prepName(u, v.names)} (#${u.slot}): REQUIRED this chapter (${v.required.source})`);
+    }
+  }
+  // Count what the roster WOULD look like, before writing anything.
+  const after = new Map(v.players.map((u) => [u.slot, prepDeployed(u)]));
+  for (const u of toDeploy) after.set(u.slot, true);
+  for (const u of toBench) after.set(u.slot, false);
+  const total = [...after].filter(([slot, on]) => on && !prepUnlistable(bySlot(v.players, slot)!)).length;
+  if (total > v.startTiles) {
+    problems.push(
+      `that would deploy ${total} units but there are ${v.startTiles} start tiles — bench ${total - v.startTiles} more in the same call. ` +
+      `Over the limit the game silently leaves the extras off the map.`,
+    );
+  }
+  if (problems.length) return `fe7_prep_select_units set refused, nothing was written:\n  - ${problems.join("\n  - ")}`;
+  const moved = await prepStillOnTopMenu(m, "set");
+  if (moved) return moved;
+
+  const changes: string[] = [];
+  const unchanged: string[] = [];
+  const writes: Array<{ u: Unit; deploy: boolean }> = [
+    ...toDeploy.map((u) => ({ u, deploy: true })),
+    ...toBench.map((u) => ({ u, deploy: false })),
+  ];
+  for (const { u, deploy } of writes) {
+    if (prepDeployed(u) === deploy) {
+      unchanged.push(`${prepName(u, v.names)} (#${u.slot}) was already ${deploy ? "deployed" : "benched"}`);
+      continue;
+    }
+    // Exactly the Pick Units toggle: bits 1 and 3 together, everything else preserved.
+    const next = (deploy ? u.flags & ~PICK_TOGGLE_BITS : u.flags | PICK_TOGGLE_BITS) >>> 0;
+    await m.call("write32", { address: u.addr + 0x0c, value: next });
+    const back = u32(await readRange(m, u.addr + 0x0c, 4), 0);
+    const ok = ((back & NOT_DEPLOYED_BIT) === 0) === deploy;
+    changes.push(
+      `${ok ? (deploy ? "DEPLOYED" : "BENCHED") : "WRITE DID NOT STICK"} ${prepName(u, v.names)} (#${u.slot}): ` +
+      `0x${u.flags.toString(16).padStart(8, "0")} -> 0x${back.toString(16).padStart(8, "0")}`,
+    );
+  }
+
+  const fresh = await readPrep(m);
+  const L = [...changes, ...unchanged];
+  if (fresh.view) {
+    const d = fresh.view.players.filter(prepDeployed).length;
+    L.push(`Now deployed ${d} / ${fresh.view.startTiles} start tiles.` + (d < fresh.view.startTiles ? ` ${fresh.view.startTiles - d} start tile(s) left empty.` : ""));
+  }
+  return L.join("\n");
+}
+
+async function fe7PrepStart(m: MgbaClient, v: PrepView, merlinus: boolean): Promise<string> {
+  if (v.required.error) return `fe7_prep_select_units start refused: ${v.required.error}`;
+  const L: string[] = [];
+  const before = new Set(v.players.filter(prepDeployed).map((u) => u.charId));
+
+  if (!v.merlinusPrompt) {
+    if (!v.onTopMenu) return `fe7_prep_select_units start refused — ${prepHeader(v).find((l) => l.startsWith("screen: "))!.replace(/^screen: /, "")} Nothing was pressed.`;
+    const missing = v.players.filter((u) => v.required.ids.has(u.charId) && !prepUnlistable(u) && !prepDeployed(u));
+    if (missing.length) {
+      return (
+        `fe7_prep_select_units start refused: required but benched — ${missing.map((u) => `${prepName(u, v.names)} (#${u.slot})`).join(", ")} ` +
+        `(${v.required.source}). Deploy them with fe7_prep_select_units set first. Nothing was pressed.`
+      );
+    }
+    const moved = await prepStillOnTopMenu(m, "start");
+    if (moved) return moved;
+    await press(m, [{ buttons: ["Start"], frames: 6, release_frames: 2 }]);
+  }
+
+  // Start settles in 0.5–1.5 s (RAM.md). Whenever Merlinus is in the party the game stops
+  // to ask about him first — at 14/14 too, he takes his own tile, not a start tile (Ch.28,
+  // 2026-11-08). The buffer held top-menu help text before the press, so "Merlinus?" in it
+  // now is fresh.
+  const started = async () => {
+    const b = await readRange(m, A.phase, 2);
+    return b[0] === 0x00 && b[1] === 1;
+  };
+  // The question reaches the buffer while its box is still opening, and a press then is
+  // swallowed (seen 2026-11-08: A sent on first sight did nothing). So wait for the box
+  // to settle, answer, and if it is still up re-send ONLY A: a second Right could move
+  // the cursor back to Yes. The map check below catches a Merlinus who slipped through.
+  let seenAt = v.merlinusPrompt ? Date.now() - PROMPT_SETTLE_MS : 0;
+  let tries = 0;
+  let lastPress = 0;
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (await started()) break;
+    if (!seenAt && (await readRawText(m)).includes("Merlinus?")) seenAt = Date.now();
+    const settled = seenAt && Date.now() - seenAt >= PROMPT_SETTLE_MS;
+    if (settled && tries < 3 && Date.now() - lastPress >= 2500) {
+      await press(m, tries === 0 && !merlinus ? ["Right", "A"] : ["A"], 3, 8);
+      if (tries === 0) L.push(`Answered "Deploy Merlinus?" with ${merlinus ? "Yes" : "No"}.`);
+      else L.push(`The prompt was still up; pressed A again (attempt ${tries + 1}).`);
+      tries++;
+      lastPress = Date.now();
+      continue;
+    }
+    await sleep(200);
+  }
+  const answered = tries > 0;
+  if (!(await started())) {
+    const ps = await readRange(m, A.phase, 2);
+    L.push(
+      `The chapter has NOT started after 15 s: phase 0x${hex2(ps[0])}, turn ${ps[1]}, text buffer ${JSON.stringify(await readText(m))}. ` +
+      `An opening event may be holding input — call fe7_unstick, which names the button.`,
+    );
+    return L.join("\n");
+  }
+
+  // Confirm by effect: who is actually standing on the map now.
+  const players = await readArray(m, A.playerArray);
+  const onMap = players.filter((u) => u.deployed && !u.dead);
+  const dropped = [...before].filter((id) => !onMap.some((u) => u.charId === id));
+  const extra = onMap.filter((u) => !before.has(u.charId));
+  L.push(`CHAPTER STARTED — turn 1, player phase. ${onMap.length} units on the map:`);
+  for (const u of onMap) L.push(`  #${u.slot} ch${hex2(u.charId)} ${prepName(u, v.names)} (${u.x},${u.y})`);
+  if (dropped.length) {
+    L.push(`DROPPED by the game — flagged deployed but not on the map: ${dropped.map((id) => v.names.get(id) ?? `ch${hex2(id)}`).join(", ")}.`);
+  }
+  // Two kinds of arrival: units in the prep roster that were benched (Merlinus via the
+  // prompt), and story units that are not in the prep roster at all and join as the map
+  // loads (Dart on the Dread Isle, 2026-11-08).
+  const inRoster = new Set(v.players.map((u) => u.charId));
+  const joined = extra.filter((u) => !inRoster.has(u.charId));
+  const promoted = extra.filter((u) => inRoster.has(u.charId));
+  if (joined.length) {
+    L.push(`JOINED at start — not in the prep roster, placed by the chapter itself: ${joined.map((u) => `${prepName(u, v.names)} (#${u.slot})`).join(", ")}.`);
+  }
+  if (promoted.length) {
+    L.push(`Also on the map though benched before start: ${promoted.map((u) => prepName(u, v.names)).join(", ")}${answered && merlinus ? " (Merlinus came from the prompt)" : ""}.`);
+  }
+  if (answered && !merlinus && onMap.some((u) => u.charId === 0x28)) {
+    L.push(`WARNING: Merlinus is on the map although the prompt was answered No — the Right press was probably dropped.`);
+  }
+  L.push(`The array was re-sorted at start: slots above are the new ones; any slot numbers from prep are stale.`);
+  return L.join("\n");
+}
+
+async function fe7Prep(m: MgbaClient, p: Record<string, unknown>): Promise<string> {
+  const action = String(p.action ?? "status");
+  const { view, refusal } = await readPrep(m);
+  if (!view) return refusal!;
+  const list = (x: unknown) => (Array.isArray(x) ? x : x === undefined ? [] : [x]);
+  switch (action) {
+    case "status":
+      return fe7PrepStatus(view);
+    case "set":
+      return fe7PrepSet(m, view, list(p.deploy), list(p.bench));
+    case "start":
+      return fe7PrepStart(m, view, p.merlinus === true || p.merlinus === "yes");
+    default:
+      return `fe7_prep_select_units: unknown action ${JSON.stringify(action)} — use status, set or start.`;
+  }
+}
+
 // ── Tool definitions ───────────────────────────────────────────────────────
+
+// `commentary` is the audience-facing sibling of `reason`: the model's in-character
+// thoughts on the chapter, rendered by the stream overlay. Every COMMENTARY_EVERY turns it
+// is required, and the SERVER decides which turns those are, from the turn counter in RAM,
+// because a model asked to "comment every third turn" loses count. Reading it fresh on
+// each call keeps it stateless, so a session restart or a mid-chapter resume cannot skew it.
+// The cap exists for the overlay: the feed column is ~270px wide and shared with reasons.
+// Declared here, above FE7_TOOLS, because the tool description interpolates them.
+const COMMENTARY_EVERY = 1;
+// Which turns need it, in words, so descriptions stay right whatever COMMENTARY_EVERY is.
+const COMMENTARY_TURNS =
+  COMMENTARY_EVERY === 1
+    ? "every turn"
+    : `turns ${COMMENTARY_EVERY}, ${COMMENTARY_EVERY * 2}, ${COMMENTARY_EVERY * 3}…`;
+const COMMENTARY_MAX = 500;
 
 export const FE7_TOOLS: Tool[] = [
   {
@@ -5179,6 +5709,41 @@ export const FE7_TOOLS: Tool[] = [
     },
   },
   {
+    name: "fe7_prep_select_units",
+    description:
+      "PURPOSE: Choose who fights this chapter on the Preparations screen, and start the chapter. " +
+      "USAGE: Only on Preparations (phase green/prep, turn 0). Call `status` first: it lists DEPLOYED, BENCHED-but-deployable and NOT DEPLOYABLE units with stats and items, the number of start tiles, and which units are REQUIRED. " +
+      "Then `set` with `deploy` and/or `bench` — do swaps in ONE call, since the deployed count may never exceed the start tiles. Then `start`. Use this instead of fe7_state while on Preparations: fe7_state's deployed list is stale for anything changed here. " +
+      "BEHAVIOR: `status` only reads. `set` presses nothing: it writes each unit's deploy flag directly, exactly as the Pick Units screen would, and refuses — writing nothing at all — if any part of the request breaks a rule: benching a REQUIRED unit (from llm_plays_fe7/required_units.json, per chapter and mode; the current mode's lord is always protected, and a chapter not listed there protects every lord), deploying a unit the game would not field, or deploying more units than there are start tiles. " +
+      "It only writes from the Preparations TOP menu, never inside Pick Units or another sub-screen; if the help text shows a sub-screen it refuses and says so — press B to back out. " +
+      "`start` presses Start, answers the \"Deploy Merlinus?\" prompt the game shows whenever he is in the party (No unless merlinus is true), waits for turn 1, then reports who is actually on the map and anyone the game dropped. It refuses while a REQUIRED unit is benched. " +
+      "RETURNS: status — the roster split three ways with reasons; set — each change with the flag before and after, and the new deployed count; start — the units on the map with their NEW slots (the array is re-sorted at start, so prep slots are stale afterwards).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["status", "set", "start"], description: "'status' (default) reads; 'set' changes who is deployed; 'start' begins the chapter." },
+        deploy: {
+          type: "array",
+          items: { type: ["string", "number"] },
+          description: "set only: units to deploy — array slot numbers from status, character names as status prints them, or chNN.",
+        },
+        bench: {
+          type: "array",
+          items: { type: ["string", "number"] },
+          description: "set only: units to bench, same forms as deploy. A swap is one call with one name in each list.",
+        },
+        merlinus: {
+          type: "boolean",
+          description: "start only: answer to \"Deploy Merlinus?\", which the game asks at start whenever Merlinus is in the party. He stands on a tile of his own, so he does not take a start tile from anyone. Merlinus is the convoy: on the map he lets adjacent units use Supply, but he cannot fight. Default false.",
+        },
+        reason: {
+          type: "string",
+          description: "REQUIRED for set and start. One sentence on why this line-up — who you are bringing for what threat or objective, and who sits out and why. Written for the human reading the run log.",
+        },
+      },
+    },
+  },
+  {
     name: "fe7_inventory_full",
     description:
       "PURPOSE: Answer the 'Your inventory is full — send an item to Merlinus' (or discard) prompt that HALTS the game when a unit already holding 5 items picks up a dropped one. " +
@@ -5233,7 +5798,8 @@ export const FE7_TOOLS: Tool[] = [
     name: "fe7_end_turn",
     description:
       "PURPOSE: End the player phase and block until the player phase comes back, so the enemy phase runs without you polling for it. " +
-      "USAGE: Call once every unit you care about has acted. Saves the repeated read-and-wait loop that ending a turn otherwise requires, and guarantees the next action you take is not silently swallowed by an in-progress enemy phase. " +
+      `USAGE: Call once every unit you care about has acted. On ${COMMENTARY_TURNS} it also needs \`commentary\` — your thoughts on the chapter for the stream — and refuses without it. ` +
+      "Saves the repeated read-and-wait loop that ending a turn otherwise requires, and guarantees the next action you take is not silently swallowed by an in-progress enemy phase. " +
       "BEHAVIOR: Drives input. Finds an empty tile near the cursor (the field menu only opens on empty ground — on a unit, A selects it instead), then uses the A/Up/A sequence. Inside the menu that is safe by structure: it wraps and End is last, so a single Up from the top entry reaches Unit or End, never Suspend. That argument only holds once the menu HAS focus, so the Up is verified by re-reading the cursor — if the cursor moved, the first A was dropped, and the sequence is restored and retried rather than pressed at the board. Retries if the phase byte does not change, then waits for the enemy and green phases to finish. " +
       "RETURNS: The turn counter, whether the player phase is already back, and a battlefield summary listing any units that fell. If the enemy phase is still running it says so and tells you to call fe7_wait — that is the normal outcome on a large map, not an error.",
     inputSchema: {
@@ -5247,6 +5813,13 @@ export const FE7_TOOLS: Tool[] = [
           type: "string",
           description:
             "REQUIRED. One sentence saying why the turn is ready to end — which units have acted, which were deliberately left idle and why, and what you expect the enemy phase to do. Written for the human reviewing the run log afterwards. The tool does not act on it, but it refuses to end the turn when it is missing or blank.",
+        },
+        commentary: {
+          type: "string",
+          description:
+            `REQUIRED on every turn whose number is a multiple of ${COMMENTARY_EVERY} (turns ${COMMENTARY_EVERY}, ${COMMENTARY_EVERY * 2}, ${COMMENTARY_EVERY * 3}…); optional on any other turn — use it then when something big happens: a death, a recruit, a plan going sideways, a lucky crit. ` +
+            "Your own thoughts on the chapter so far, in the first person, shown to viewers on the stream overlay. Talk about how the chapter is going, how you feel about the objectives, how well you think you are playing, anything that has been unexpected or surprising thus far, any units who are overperforming or underperforming" +
+            `. At most ${COMMENTARY_MAX} characters. On a required turn the tool refuses to end the turn without it, pressing nothing, and it refuses an over-long one the same way.`,
         },
       },
       required: ["reason"],
@@ -5278,6 +5851,29 @@ export const FE7_TOOLS: Tool[] = [
 // log, where every call's params are recorded verbatim. It is enforced here because the
 // MCP client does not reliably enforce `required`, and a missing reason is exactly the
 // call a reviewer most wants explained. Refused before anything is pressed.
+/** `commentary` rule (see COMMENTARY_EVERY). Refusal text, or null when the call may proceed. Pure, so the rule is testable. */
+function commentaryProblem(turn: number, commentary: string): string | null {
+  if (commentary.length > COMMENTARY_MAX) {
+    return (
+      `fe7_end_turn: commentary is ${commentary.length} characters; the limit is ${COMMENTARY_MAX}, ` +
+      `because the overlay has to fit it in a narrow column. Nothing was pressed; tighten it and call again.`
+    );
+  }
+  if (turn > 0 && turn % COMMENTARY_EVERY === 0 && commentary.length === 0) {
+    return (
+      `fe7_end_turn: turn ${turn} is a commentary turn (every ${COMMENTARY_EVERY}th), so \`commentary\` is required: ` +
+      `your first-person thoughts for the stream on how the chapter is going, the objective, and how ` +
+      `well you are playing, in at most ${COMMENTARY_MAX} characters. Nothing was pressed; call again with commentary set (and the same reason).`
+    );
+  }
+  return null;
+}
+
+// Set by dispatchFe7 when an fe7_end_turn call accepts commentary, and written by
+// handleFe7 as its own log record AFTER that call's record, so the overlay shows the
+// thoughts below the end-turn reason and a refused call never produces one.
+let acceptedCommentary: { turn: number; text: string } | null = null;
+
 function missingReason(tool: string, p: Record<string, unknown>): string | null {
   const r = typeof p.reason === "string" ? p.reason.trim() : "";
   if (r.length > 0) return null;
@@ -5297,11 +5893,13 @@ export async function handleFe7(
 
   const started = Date.now();
   let result: Awaited<ReturnType<typeof dispatchFe7>>;
+  acceptedCommentary = null;
   try {
     result = await dispatchFe7(name, p, m);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     await logLine({ kind: "call", tool: name, params: p, ms: Date.now() - started, result: `THREW: ${msg}` });
+    await logCommentary();
     return wrap(`${name} failed: ${msg}`);
   }
   if (result) {
@@ -5312,7 +5910,15 @@ export async function handleFe7(
       .join("\n");
     await logLine({ kind: "call", tool: name, params: p, ms: Date.now() - started, result: text.slice(0, 2000) });
   }
+  await logCommentary();
   return result;
+}
+
+/** The overlay reads these records, never the params, so a refused call cannot leak onto the stream. */
+async function logCommentary(): Promise<void> {
+  if (!acceptedCommentary) return;
+  await logLine({ kind: "commentary", tool: "fe7_end_turn", turn: acceptedCommentary.turn, text: acceptedCommentary.text });
+  acceptedCommentary = null;
 }
 
 async function dispatchFe7(
@@ -5394,7 +6000,17 @@ async function dispatchFe7(
     case "fe7_end_turn": {
       const noReason = missingReason("fe7_end_turn", p);
       if (noReason) return wrap(noReason);
-      return wrap(await fe7EndTurn(m, Number(p.timeout_ms ?? 12000)));
+      const commentary = typeof p.commentary === "string" ? p.commentary.replace(/\s+/g, " ").trim() : "";
+      const clock = await phaseClock(m);
+      // Off the player phase fe7EndTurn presses nothing and says so; demanding
+      // commentary there would only hide that answer behind a refusal.
+      if (clock.phase === 0x00) {
+        const problem = commentaryProblem(clock.turn, commentary);
+        if (problem) return wrap(problem);
+        if (commentary) acceptedCommentary = { turn: clock.turn, text: commentary };
+      }
+      const ended = await fe7EndTurn(m, Number(p.timeout_ms ?? 12000));
+      return wrap(acceptedCommentary ? `Commentary recorded for turn ${clock.turn}.\n${ended}` : ended);
     }
 
     case "fe7_wait":
@@ -5402,6 +6018,14 @@ async function dispatchFe7(
 
     case "fe7_inventory_full":
       return wrap(await fe7InventoryFull(m, Number(p.index)));
+
+    case "fe7_prep_select_units": {
+      if (p.action === "set" || p.action === "start") {
+        const noReason = missingReason("fe7_prep_select_units", p);
+        if (noReason) return wrap(noReason);
+      }
+      return wrap(await fe7Prep(m, p));
+    }
 
     default:
       return null;
