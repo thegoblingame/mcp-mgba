@@ -84,31 +84,8 @@ end
 local press_queue = {}
 local active                   -- { bits, hold_remaining, release_remaining }
 
--- Additive vision lease. Legacy clients retain their existing behavior when
--- no lease exists. A lease belongs to the TCP socket, not a player-supplied ID.
+-- Connected TCP clients.
 local clients = {}
-local vision_owner
-local VISION_METHODS = {
-    vision_claim = true, ping = true, get_info = true, input_status = true,
-    press_buttons = true, press_sequence = true, screenshot = true,
-}
-
-local function claim_vision(c)
-    if vision_owner and vision_owner ~= c then
-        return nil, { code = -32010, message = "vision controller already claimed" }
-    end
-    local pending = #press_queue + (active and 1 or 0)
-    if not vision_owner then
-        if #clients ~= 1 then
-            return nil, { code = -32011, message = "vision claim requires exactly one connected client" }
-        end
-        if pending ~= 0 then
-            return nil, { code = -32012, message = "vision claim requires an empty input queue" }
-        end
-        vision_owner = c
-    end
-    return { version = 1, claimed = true, controlling_clients = 1, pending = pending }, nil
-end
 
 -- ── Command handlers ────────────────────────────────────────────────────────
 
@@ -652,19 +629,10 @@ local HANDLERS = {
     load_state     = cmd_load_state,
 }
 
-local function dispatch(cmd, c)
+local function dispatch(cmd)
     if not cmd.method then
         return nil, { code = -32600, message = "missing method field" }
     end
-    if vision_owner then
-        if vision_owner ~= c then
-            return nil, { code = -32010, message = "bridge reserved by vision controller" }
-        end
-        if not VISION_METHODS[cmd.method] then
-            return nil, { code = -32601, message = "method unavailable in vision session" }
-        end
-    end
-    if cmd.method == "vision_claim" then return claim_vision(c) end
     local handler = HANDLERS[cmd.method]
     if not handler then
         return nil, { code = -32601, message = "unknown method: " .. cmd.method }
@@ -690,7 +658,7 @@ local function process_buffer(c)
             local parse_ok, cmd = pcall(json.decode, line)
             local response
             if parse_ok and type(cmd) == "table" then
-                local result, rpc_err = dispatch(cmd, c)
+                local result, rpc_err = dispatch(cmd)
                 if rpc_err then
                     response = { id = cmd.id, error = rpc_err }
                 else
@@ -760,11 +728,9 @@ callbacks:add("frame", function()
                 i = i + 1
             elseif ok and data == nil then
                 console:log("[mcp-mgba] client disconnected")
-                if vision_owner == c then vision_owner = nil end
                 table.remove(clients, i)
             else
                 console:log("[mcp-mgba] receive error: " .. tostring(data))
-                if vision_owner == c then vision_owner = nil end
                 table.remove(clients, i)
             end
         else

@@ -27,7 +27,6 @@ export interface MgbaClientOptions {
   connectTimeoutMs?: number;
   rpcTimeoutMs?: number;
   maxResponseBytes?: number;
-  strictResponses?: boolean;
   /** Dependency injection for deterministic connection-timeout tests. */
   createConnection?: typeof net.createConnection;
 }
@@ -50,17 +49,14 @@ export class MgbaClient {
   private readonly connectTimeoutMs: number;
   private readonly rpcTimeoutMs: number;
   private readonly maxResponseBytes: number;
-  private readonly strictResponses: boolean;
   private readonly createConnection: typeof net.createConnection;
   private readonly disconnectListeners = new Set<(generation: number) => void>();
 
   constructor(private readonly host = "127.0.0.1", private readonly port = 8765, options: MgbaClientOptions = {}) {
-    // Full server's synchronous frame/search operations need generous defaults.
-    // The vision profile opts into substantially smaller limits.
+    // The server's synchronous frame/search operations need generous defaults.
     this.connectTimeoutMs = positive(options.connectTimeoutMs ?? 5000);
     this.rpcTimeoutMs = positive(options.rpcTimeoutMs ?? 120_000);
     this.maxResponseBytes = positive(options.maxResponseBytes ?? 32 * 1024 * 1024);
-    this.strictResponses = options.strictResponses ?? false;
     this.createConnection = options.createConnection ?? net.createConnection;
   }
 
@@ -184,7 +180,6 @@ export class MgbaClient {
         const hasResult = Object.hasOwn(response, "result");
         const hasError = Object.hasOwn(response, "error");
         if (hasResult && hasError) throw new Error();
-        if (this.strictResponses && !hasResult && !hasError) throw new Error();
         if (hasError && (!response.error || typeof response.error !== "object" ||
           !Number.isSafeInteger(response.error.code) || typeof response.error.message !== "string")) throw new Error();
       } catch { this.end(state, "PROTOCOL_ERROR"); return; }

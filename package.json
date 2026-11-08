@@ -5,8 +5,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "mcp-mgba": "dist/index.js",
-    "mcp-mgba-vision": "dist/vision-index.js"
+    "mcp-mgba": "dist/index.js"
   },
   "files": [
     "dist/",
@@ -16,12 +15,11 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc && node -e \"import('node:fs').then(fs => { for (const p of ['dist/index.js', 'dist/vision-index.js']) fs.chmodSync(p, 0o755) })\"",
+    "build": "tsc && node -e \"import('node:fs').then(fs => { fs.chmodSync('dist/index.js', 0o755) })\"",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test test/*.test.mjs",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
-    "start:vision": "node dist/vision-index.js",
     "prepare": "npm run build",
     "inspector": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
